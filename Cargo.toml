@@ -1,0 +1,21 @@
+[package]
+name = "rust-forward"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.30", features = ["rustls-tls-webpki-roots"] }
+rustls = { version = "0.23", features = ["aws_lc_rs"] }
+sha2 = "0.10"
+rand = "0.8"
+futures-util = "0.3"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4", features = ["derive"] }
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
