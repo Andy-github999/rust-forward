@@ -298,8 +298,17 @@ async fn ws_session(
                                 let _ = state.data_tx.send(payload);
                             }
                         }
-                        Ok(Message::Close(_)) => break,
-                        Err(e) => { warn!("WSS read error: {}", e); break; }
+                        Ok(Message::Close(_)) => {
+                            *shared_writer.write().await = None;
+                            streams.lock().await.clear();
+                            break;
+                        }
+                        Err(e) => {
+                            warn!("WSS read error: {}", e);
+                            *shared_writer.write().await = None;
+                            streams.lock().await.clear();
+                            break;
+                        }
                         _ => {}
                     }
                 }
