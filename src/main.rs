@@ -82,6 +82,19 @@ async fn main() {
     let ws_url = resolve_ws_url(args.ws_url.as_deref());
 
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
+    // Ctrl+C 优雅关闭
+    let mode = args.mode.clone();
+    tokio::spawn(async move {
+        tokio::signal::ctrl_c().await.ok();
+        info!("Shutting down...");
+        if mode == "socks5-ws" {
+            // 桥接端：让 ws_session 的 reader 错误退出，自动清理
+            std::process::exit(0);
+        }
+        std::process::exit(0);
+    });
+
     match args.mode.as_str() {
         "ws-server" => run_ws_server(args, password).await,
         "socks5-ws" => run_socks5_bridge(args, password, ws_url).await,
@@ -267,6 +280,18 @@ async fn ws_session(
                 *shared_writer.write().await = Some(writer.clone());
                 streams.lock().await.clear();
                 info!("WSS connected, session running");
+
+                // 保活 ping：每 30 秒发 ping 防止 CF 空闲断连
+                let ka_writer = writer.clone();
+                tokio::spawn(async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                        let mut w = ka_writer.lock().await;
+                        if w.send(Message::Ping(vec![].into())).await.is_err() {
+                            break;
+                        }
+                    }
+                });
 
                 while let Some(msg) = reader.next().await {
                     match msg {
