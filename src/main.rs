@@ -232,106 +232,118 @@ async fn serve_ws(
     Ok(())
 }
 
-// ====================== SOCKS5 → WS Bridge (PC) ======================
+// ====================== SOCKS5 → WS Bridge (PC) with auto-reconnect ======================
+
+type SharedWriter = Arc<tokio::sync::RwLock<Option<WsWriter>>>;
+
+async fn connect_wss(url: &str, insecure: bool) -> Result<(tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, tokio_tungstenite::tungstenite::handshake::client::Response)> {
+    let connector = if insecure {
+        let tls_config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(NoopVerifier))
+            .with_no_client_auth();
+        Some(tokio_tungstenite::Connector::Rustls(Arc::new(tls_config)))
+    } else {
+        None
+    };
+    tokio_tungstenite::connect_async_tls_with_config(url, None, true, connector)
+        .await
+        .map_err(|e| anyhow::anyhow!("WSS connect failed: {}", e))
+}
+
+async fn ws_session(
+    ws_url: String,
+    _password: String,
+    shared_writer: SharedWriter,
+    streams: Arc<Mutex<HashMap<u16, StreamState>>>,
+    insecure: bool,
+) {
+    loop {
+        info!("Connecting WSS...");
+        match connect_wss(&ws_url, insecure).await {
+            Ok((ws, _)) => {
+                let (writer, mut reader) = ws.split();
+                let writer = Arc::new(Mutex::new(writer));
+                *shared_writer.write().await = Some(writer.clone());
+                streams.lock().await.clear();
+                info!("WSS connected, session running");
+
+                while let Some(msg) = reader.next().await {
+                    match msg {
+                        Ok(Message::Text(text)) => {
+                            let t = text.trim().to_string();
+                            let parts: Vec<&str> = t.splitn(3, ' ').collect();
+                            if parts.len() >= 2 {
+                                let sid = parts[1].parse::<u16>().unwrap_or(0);
+                                if parts[0] == "200" {
+                                    let mut st = streams.lock().await;
+                                    if let Some(state) = st.remove(&sid) {
+                                        let _ = state.ready.send(Ok(()));
+                                        let (tx, _) = tokio::sync::oneshot::channel();
+                                        st.entry(sid).or_insert(StreamState { ready: tx, data_tx: state.data_tx });
+                                    }
+                                } else if parts[0] == "502" {
+                                    let mut st = streams.lock().await;
+                                    if let Some(state) = st.remove(&sid) {
+                                        let _ = state.ready.send(Err(anyhow::anyhow!(t)));
+                                    }
+                                }
+                            }
+                        }
+                        Ok(Message::Binary(data)) => {
+                            if data.len() < 2 { continue; }
+                            let sid = u16::from_be_bytes([data[0], data[1]]);
+                            let payload = data[2..].to_vec();
+                            if let Some(state) = streams.lock().await.get(&sid) {
+                                let _ = state.data_tx.send(payload);
+                            }
+                        }
+                        Ok(Message::Close(_)) => break,
+                        Err(e) => { warn!("WSS read error: {}", e); break; }
+                        _ => {}
+                    }
+                }
+            }
+            Err(e) => { warn!("WSS connect failed: {}", e); }
+        }
+
+        *shared_writer.write().await = None;
+        streams.lock().await.clear();
+        info!("Reconnecting in 3s...");
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    }
+}
 
 async fn run_socks5_bridge(args: Args, password: String, ws_url: String) {
     info!("SOCKS5→WS bridge (multiplex) listening on {}", args.listen);
     info!("WS server: {}", ws_url);
 
-    // 建立持久 WSS 连接
-    let connector = if args.insecure {
-        let tls_config = rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(std::sync::Arc::new(NoopVerifier))
-            .with_no_client_auth();
-        Some(tokio_tungstenite::Connector::Rustls(std::sync::Arc::new(
-            tls_config,
-        )))
-    } else {
-        None
-    };
-
-    let (ws, _) = tokio_tungstenite::connect_async_tls_with_config(
-        &ws_url,
-        None,
-        true,
-        connector,
-    )
-    .await
-    .expect("Failed to connect WSS");
-    let (ws_writer, ws_reader) = ws.split();
-    let ws_writer: WsWriter = Arc::new(Mutex::new(ws_writer));
-
-    // 流注册表：sid → (ready_sender, data_sender)
-    let streams: Arc<Mutex<HashMap<u16, StreamState>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let shared_writer: SharedWriter = Arc::new(tokio::sync::RwLock::new(None));
+    let streams: Arc<Mutex<HashMap<u16, StreamState>>> = Arc::new(Mutex::new(HashMap::new()));
     let next_id = Arc::new(AtomicU16::new(1));
 
-    // WS 后台读循环
-    let streams_rd = streams.clone();
-    tokio::spawn(async move {
-        let mut reader = ws_reader;
-        while let Some(msg) = reader.next().await {
-            match msg {
-                Ok(Message::Text(text)) => {
-                    let t = text.trim().to_string();
-                    let parts: Vec<&str> = t.splitn(3, ' ').collect();
-                    if parts.len() >= 2 {
-                        let sid = parts[1].parse::<u16>().unwrap_or(0);
-                        if parts[0] == "200" {
-                            let mut st = streams_rd.lock().await;
-                            if let Some(state) = st.remove(&sid) {
-                                let _ = state.ready.send(Ok(()));
-                                // 重新插回，保持 data_tx 可用
-                                let (tx, _) = tokio::sync::oneshot::channel();
-                                st.entry(sid).or_insert(StreamState {
-                                    ready: tx,
-                                    data_tx: state.data_tx,
-                                });
-                            }
-                        } else if parts[0] == "502" {
-                            warn!("sid={} error: {}", sid, t);
-                            let mut st = streams_rd.lock().await;
-                            if let Some(state) = st.remove(&sid) {
-                                let _ = state.ready.send(Err(anyhow::anyhow!(t)));
-                            }
-                        }
-                    }
-                }
-                Ok(Message::Binary(data)) => {
-                    if data.len() < 2 {
-                        continue;
-                    }
-                    let sid = u16::from_be_bytes([data[0], data[1]]);
-                    let payload = data[2..].to_vec();
-                    let st = streams_rd.lock().await;
-                    if let Some(state) = st.get(&sid) {
-                        let _ = state.data_tx.send(payload);
-                    }
-                }
-                Ok(Message::Close(_)) => break,
-                Err(_) => break,
-                _ => {}
-            }
-        }
-    });
+    {
+        let sw = shared_writer.clone();
+        let st = streams.clone();
+        let url = ws_url.clone();
+        let pwd = password.clone();
+        tokio::spawn(async move { ws_session(url, pwd, sw, st, args.insecure).await; });
+    }
 
-    // 接受 SOCKS5 连接
     let listener = TcpListener::bind(&args.listen).await.unwrap();
     loop {
         let (stream, addr) = listener.accept().await.unwrap();
-        let ws_w = ws_writer.clone();
-        let streams_w = streams.clone();
+        let sw = shared_writer.clone();
+        let st = streams.clone();
         let sid = next_id.fetch_add(1, Ordering::Relaxed);
         let pwd = password.clone();
 
-        let streams_c = streams_w.clone();
+        let st_c = st.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_socks5(stream, addr, ws_w, streams_w, sid, &pwd).await {
+            if let Err(e) = handle_socks5(stream, addr, sw, st, sid, &pwd, args.buf_size).await {
                 error!("[{}] sid={} {}", addr, sid, e);
             }
-            // 清理注册
-            streams_c.lock().await.remove(&sid);
+            st_c.lock().await.remove(&sid);
         });
     }
 }
@@ -339,123 +351,70 @@ async fn run_socks5_bridge(args: Args, password: String, ws_url: String) {
 async fn handle_socks5(
     mut tcp: tokio::net::TcpStream,
     addr: SocketAddr,
-    ws_writer: WsWriter,
+    shared_writer: SharedWriter,
     streams: Arc<Mutex<HashMap<u16, StreamState>>>,
     sid: u16,
     password: &str,
+    buf_size: usize,
 ) -> Result<()> {
-    // SOCKS5 握手
     let mut buf = [0u8; 300];
     let n = tcp.read(&mut buf).await?;
-    if n < 3 || buf[0] != 0x05 {
-        return Ok(());
-    }
+    if n < 3 || buf[0] != 0x05 { return Ok(()); }
     tcp.write_all(&[0x05, 0x00]).await?;
     let n = tcp.read(&mut buf).await?;
-    if n < 7 || buf[0] != 0x05 || buf[1] != 0x01 {
-        return Ok(());
-    }
+    if n < 7 || buf[0] != 0x05 || buf[1] != 0x01 { return Ok(()); }
 
     let target = match buf[3] {
-        0x01 => {
-            let ip = std::net::Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]);
-            let port = u16::from_be_bytes([buf[8], buf[9]]);
-            format!("{}:{}", ip, port)
-        }
-        0x03 => {
-            let len = buf[4] as usize;
-            let domain = String::from_utf8_lossy(&buf[5..5 + len]);
-            let port = u16::from_be_bytes([buf[5 + len], buf[5 + len + 1]]);
-            format!("{}:{}", domain, port)
-        }
-        0x04 => {
-            let mut octets = [0u8; 16];
-            octets.copy_from_slice(&buf[4..20]);
-            let ip = std::net::Ipv6Addr::from(octets);
-            let port = u16::from_be_bytes([buf[20], buf[21]]);
-            format!("[{}]:{}", ip, port)
-        }
+        0x01 => { let ip = std::net::Ipv4Addr::new(buf[4], buf[5], buf[6], buf[7]); let port = u16::from_be_bytes([buf[8], buf[9]]); format!("{}:{}", ip, port) }
+        0x03 => { let len = buf[4] as usize; let domain = String::from_utf8_lossy(&buf[5..5+len]); let port = u16::from_be_bytes([buf[5+len], buf[5+len+1]]); format!("{}:{}", domain, port) }
+        0x04 => { let mut octets = [0u8; 16]; octets.copy_from_slice(&buf[4..20]); let ip = std::net::Ipv6Addr::from(octets); let port = u16::from_be_bytes([buf[20], buf[21]]); format!("[{}]:{}", ip, port) }
         _ => return Ok(()),
     };
-
     info!("[{}] sid={} target={}", addr, sid, target);
 
-    // 注册流
+    let ws_writer = match shared_writer.read().await.as_ref() {
+        Some(w) => w.clone(),
+        None => { warn!("[{}] WSS not connected", addr); return Ok(()); }
+    };
+
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<()>>();
     let (data_tx, mut data_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    streams.lock().await.insert(sid, StreamState { ready: ready_tx, data_tx });
 
-    {
-        let mut st = streams.lock().await;
-        st.insert(sid, StreamState {
-            ready: ready_tx,
-            data_tx,
-        });
-    }
-
-    // 发送 CONNECT 到服务端
     {
         let mut w = ws_writer.lock().await;
-        let msg = format!("CONNECT {} {} {}", sid, target, password);
-        w.send(Message::Text(msg.into())).await?;
+        w.send(Message::Text(format!("CONNECT {} {} {}", sid, target, password).into())).await?;
     }
 
-    // 等待 200/502
     match ready_rx.await {
-        Ok(Ok(())) => {
-            // SOCKS5 回复成功
-            tcp.write_all(&[0x05, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]).await?;
-            info!("[{}] sid={} tunneling", addr, sid);
-        }
-        Ok(Err(e)) => {
-            warn!("[{}] sid={} server error: {}", addr, sid, e);
-            return Ok(());
-        }
-        Err(_) => {
-            warn!("[{}] sid={} channel closed", addr, sid);
-            return Ok(());
-        }
+        Ok(Ok(())) => { tcp.write_all(&[0x05, 0x00, 0x00, 0x01, 0,0,0,0, 0,0]).await?; info!("[{}] sid={} tunneling", addr, sid); }
+        Ok(Err(e)) => { warn!("[{}] sid={} server error: {}", addr, sid, e); return Ok(()); }
+        Err(_) => { warn!("[{}] sid={} channel closed", addr, sid); return Ok(()); }
     }
 
-    // 双向转发：各跑各的，都等
     let (mut tcp_r, mut tcp_w) = tcp.into_split();
-
-    let w_clone = ws_writer.clone();
+    let w = ws_writer.clone();
     let tcp_to_ws = tokio::spawn(async move {
-        let mut buf = vec![0u8; 65536];
+        let mut buf = vec![0u8; buf_size];
         loop {
             match tcp_r.read(&mut buf).await {
                 Ok(0) => break,
                 Ok(n) => {
+                    let mut ww = w.lock().await;
                     let mut frame = Vec::with_capacity(2 + n);
                     frame.extend_from_slice(&sid.to_be_bytes());
                     frame.extend_from_slice(&buf[..n]);
-                    let mut w = w_clone.lock().await;
-                    if w.send(Message::Binary(frame.into())).await.is_err() {
-                        break;
-                    }
+                    if ww.send(Message::Binary(frame.into())).await.is_err() { break; }
                 }
                 Err(_) => break,
             }
         }
     });
-
-    let ws_to_tcp = tokio::spawn(async move {
-        while let Some(data) = data_rx.recv().await {
-            if tcp_w.write_all(&data).await.is_err() {
-                break;
-            }
-        }
-    });
-
-    // 等两个方向都完成
+    let ws_to_tcp = tokio::spawn(async move { while let Some(d) = data_rx.recv().await { if tcp_w.write_all(&d).await.is_err() { break; } } });
     let _ = tokio::join!(tcp_to_ws, ws_to_tcp);
 
-    // 关闭
-    {
-        let mut w = ws_writer.lock().await;
-        let _ = w.send(Message::Text(format!("CLOSE {}", sid).into())).await;
-    }
-
+    let mut w = ws_writer.lock().await;
+    let _ = w.send(Message::Text(format!("CLOSE {}", sid).into())).await;
     Ok(())
 }
 
