@@ -4,12 +4,17 @@ on:
   workflow_dispatch:
     inputs:
       password:
-        description: 'Override default password (leave empty for built-in 123456)'
+        description: 'Override password (leave empty to use secret)'
+        required: false
+        type: string
+      ws_url:
+        description: 'Override WS URL (leave empty to use secret)'
         required: false
         type: string
 
 env:
-  RUST_FORWARD_PASSWORD: ${{ inputs.password }}
+  RUST_FORWARD_PASSWORD: ${{ inputs.password || secrets.RUST_FORWARD_PASSWORD || '123456' }}
+  RUST_FORWARD_WS_URL: ${{ inputs.ws_url || secrets.RUST_FORWARD_WS_URL }}
 
 permissions:
   contents: write
