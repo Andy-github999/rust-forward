@@ -1,0 +1,68 @@
+name: Build rust-forward
+
+on:
+  workflow_dispatch:
+    inputs:
+      password:
+        description: 'Override default password (leave empty for built-in 123456)'
+        required: false
+        type: string
+
+env:
+  RUST_FORWARD_PASSWORD: ${{ inputs.password }}
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release
+      - uses: ncipollo/release-action@v1
+        with:
+          allowUpdates: true
+          tag: nightly
+          commit: main
+          replacesArtifacts: true
+          artifacts: target/release/rust-forward.exe
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+      - run: cargo build --release --target x86_64-unknown-linux-gnu
+      - uses: ncipollo/release-action@v1
+        with:
+          allowUpdates: true
+          tag: nightly
+          commit: main
+          replacesArtifacts: true
+          artifacts: target/x86_64-unknown-linux-gnu/release/rust-forward
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  openwrt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+      - name: Install zigbuild
+        run: pip3 install cargo-zigbuild
+      - name: Build with zigbuild
+        run: cargo zigbuild --release --target aarch64-unknown-linux-musl
+      - uses: ncipollo/release-action@v1
+        with:
+          allowUpdates: true
+          tag: nightly
+          commit: main
+          replacesArtifacts: true
+          artifacts: target/aarch64-unknown-linux-musl/release/rust-forward
+          token: ${{ secrets.GITHUB_TOKEN }}
