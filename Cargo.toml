@@ -1,0 +1,30 @@
+[package]
+name = "rust-forward"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "bridge"
+path = "src/bin/bridge.rs"
+
+[[bin]]
+name = "forward"
+path = "src/bin/forward.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+rustls = { version = "0.23", default-features = false, features = ["ring"] }
+tokio-rustls = "0.26"
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4", features = ["derive"] }
+h2 = "0.4"
+bytes = "1"
+http = "1"
+socket2 = "0.5"
+rcgen = "0.13"
+[profile.release]
+lto = "fat"
+codegen-units = 1
+strip = "symbols"

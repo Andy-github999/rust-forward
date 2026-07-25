@@ -1,0 +1,63 @@
+name: Build rust-forward
+
+on:
+  workflow_dispatch:
+    inputs:
+      password:
+        description: 'Override password (leave empty to use secret)'
+        required: false
+        type: string
+      ws_url:
+        description: 'Override WS URL (leave empty to use secret)'
+        required: false
+        type: string
+
+env:
+  RUST_FORWARD_PASSWORD: ${{ inputs.password || secrets.RUST_FORWARD_PASSWORD || '123456' }}
+  RUST_FORWARD_WS_URL: ${{ inputs.ws_url || secrets.RUST_FORWARD_WS_URL }}
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: cargo build --release --bin bridge
+      - run: cargo build --release --bin forward
+      - uses: ncipollo/release-action@v1
+        with:
+          allowUpdates: true
+          tag: nightly
+          commit: main
+          replacesArtifacts: true
+          artifacts: |
+            target/release/bridge.exe
+            target/release/forward.exe
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  openwrt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+      - name: Install zigbuild
+        run: pip3 install cargo-zigbuild
+      - name: Build bridge
+        run: cargo zigbuild --release --target aarch64-unknown-linux-musl --bin bridge
+      - name: Build forward
+        run: cargo zigbuild --release --target aarch64-unknown-linux-musl --bin forward
+      - uses: ncipollo/release-action@v1
+        with:
+          allowUpdates: true
+          tag: nightly
+          commit: main
+          replacesArtifacts: true
+          artifacts: |
+            target/aarch64-unknown-linux-musl/release/bridge
+            target/aarch64-unknown-linux-musl/release/forward
+          token: ${{ secrets.GITHUB_TOKEN }}
