@@ -13,16 +13,23 @@ use bytes::Bytes;
 
 type SessionId = u64;
 
+fn now_ms() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
+}
+
 struct Session {
     target: Arc<tokio::sync::Mutex<tokio::net::TcpStream>>,
+    last_active: AtomicU64,
 }
 
 struct AppState {
     password: String,
     connect_timeout: u64,
+    max_sessions: usize,
+    idle_timeout: Duration,
     sessions: RwLock<HashMap<SessionId, Session>>,
     next_id: AtomicU64,
-    /// HMAC nonce replay protection: (nonce, insertion_time)
     nonces: Mutex<Vec<([u8; 16], Instant)>>,
 }
 
@@ -45,8 +52,11 @@ struct Args {
     password: Option<String>,
     #[arg(long, default_value = "10")]
     connect_timeout: u64,
+    #[arg(long, default_value = "1024")]
+    max_sessions: usize,
+    #[arg(long, default_value = "300")]
+    idle_timeout: u64,
 }
-
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -79,16 +89,35 @@ async fn main() -> Result<()> {
 
     let la: SocketAddr = args.listen.parse().expect("bind addr");
     let lis = tokio::net::TcpListener::bind(la).await.unwrap();
-    info!("forward (H2) on {}", la);
-
+    let max_sessions = args.max_sessions;
+    let idle_timeout = Duration::from_secs(args.idle_timeout);
 
     let state = Arc::new(AppState {
         password,
         connect_timeout,
+        max_sessions,
+        idle_timeout,
         sessions: RwLock::new(HashMap::new()),
         next_id: AtomicU64::new(1),
         nonces: Mutex::new(Vec::new()),
     });
+
+    // Session idle cleanup
+    {
+        let st = state.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(st.idle_timeout / 2).await;
+                let mut sessions = st.sessions.write().await;
+                let before = sessions.len();
+                let deadline = now_ms() - st.idle_timeout.as_millis() as u64;
+                sessions.retain(|_, s| s.last_active.load(Ordering::Relaxed) >= deadline);
+                if sessions.len() != before {
+                    info!("session cleanup: {} -> {}", before, sessions.len());
+                }
+            }
+        });
+    }
 
     loop {
         match lis.accept().await {
@@ -212,11 +241,22 @@ async fn handle_stream(
         info!("read {} bytes from target", resp_data.len());
         if resp_data.is_empty() { return send_err(respond, 504, "no response").await; }
 
+        // Check session limit
+        {
+            let sessions = state.sessions.read().await;
+            if sessions.len() >= state.max_sessions {
+                info!("session limit reached ({})", state.max_sessions);
+                return send_err(respond, 503, "too many sessions").await;
+            }
+        }
+
         // Store session
         let sid = state.next_id.fetch_add(1, Ordering::Relaxed);
         let tgt = Arc::new(tokio::sync::Mutex::new(target_stream));
-        state.sessions.write().await.insert(sid, Session { target: tgt });
-
+        state.sessions.write().await.insert(sid, Session {
+            target: tgt,
+            last_active: AtomicU64::new(now_ms()),
+        });
         // Return 200 + ServerHello + SID
         let resp = http::Response::builder()
             .status(200)
@@ -290,6 +330,10 @@ async fn handle_stream(
                     _ => {}
                 }
                 drop(t);
+                // Update session last_active (read lock, atomic store)
+                if let Some(s) = state.sessions.read().await.get(&sid) {
+                    s.last_active.store(now_ms(), Ordering::Relaxed);
+                }
                 info!("[/data] return {} bytes", resp.len());
 
                 let resp_http = http::Response::builder()
