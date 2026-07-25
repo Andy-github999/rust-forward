@@ -5,9 +5,9 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::RwLock;
+use tokio::sync::{RwLock, Mutex};
 use rust_forward::*;
 use bytes::Bytes;
 
@@ -22,6 +22,8 @@ struct AppState {
     connect_timeout: u64,
     sessions: RwLock<HashMap<SessionId, Session>>,
     next_id: AtomicU64,
+    /// HMAC nonce replay protection: (nonce, insertion_time)
+    nonces: Mutex<Vec<([u8; 16], Instant)>>,
 }
 
 fn get_query_param(query: &str, key: &str) -> Option<String> {
@@ -79,11 +81,13 @@ async fn main() -> Result<()> {
     let lis = tokio::net::TcpListener::bind(la).await.unwrap();
     info!("forward (H2) on {}", la);
 
+
     let state = Arc::new(AppState {
         password,
         connect_timeout,
         sessions: RwLock::new(HashMap::new()),
         next_id: AtomicU64::new(1),
+        nonces: Mutex::new(Vec::new()),
     });
 
     loop {
@@ -137,10 +141,7 @@ async fn handle_stream(
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_default();
     let method = head.method.as_str().to_string();
-    let auth = head.headers.get("x-password")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("(none)");
-    info!(">>> {} {} auth={}", method, path, auth);
+    info!(">>> {} {}", method, path);
 
     // ===== POST /connect =====
     if path.starts_with("/connect") {
@@ -148,8 +149,30 @@ async fn handle_stream(
             .and_then(|q| get_query_param(q, "target"))
             .unwrap_or_default();
         if target.is_empty() { return send_err(respond, 400, "no target").await; }
-        if !state.password.is_empty() && auth != state.password {
-            return send_err(respond, 502, "bad auth").await;
+
+        // HMAC verification
+        if !state.password.is_empty() {
+            let time = head.headers.get("x-time").and_then(|v| v.to_str().ok()).unwrap_or("");
+            let nonce_h = head.headers.get("x-nonce").and_then(|v| v.to_str().ok()).unwrap_or("");
+            let sign = head.headers.get("x-sign").and_then(|v| v.to_str().ok()).unwrap_or("");
+            if !hmac_verify(state.password.as_bytes(), time, nonce_h, sign, "/connect", "") {
+                return send_err(respond, 502, "bad auth").await;
+            }
+            // Replay protection
+            if let Some(nonce_bytes) = hex::decode(nonce_h).ok().filter(|v| v.len() == 16) {
+                let mut arr = [0u8; 16];
+                arr.copy_from_slice(&nonce_bytes);
+                let mut nonces = state.nonces.lock().await;
+                // lazy cleanup: remove expired entries
+                if nonces.len() > 10_000 {
+                    nonces.retain(|(_, t)| t.elapsed() < std::time::Duration::from_secs(30));
+                }
+                // check for duplicate
+                if nonces.iter().any(|(n, _)| *n == arr) {
+                    return send_err(respond, 502, "replay").await;
+                }
+                nonces.push((arr, Instant::now()));
+            }
         }
 
         // Read ClientHello from body
@@ -213,8 +236,28 @@ async fn handle_stream(
             .unwrap_or(0);
         info!("[/data] sid={}", sid);
 
-        if !state.password.is_empty() && auth != state.password {
-            return send_err(respond, 502, "bad auth").await;
+        // HMAC verification
+        if !state.password.is_empty() {
+            let time = head.headers.get("x-time").and_then(|v| v.to_str().ok()).unwrap_or("");
+            let nonce_h = head.headers.get("x-nonce").and_then(|v| v.to_str().ok()).unwrap_or("");
+            let sign = head.headers.get("x-sign").and_then(|v| v.to_str().ok()).unwrap_or("");
+            let sid_str = sid.to_string();
+            if !hmac_verify(state.password.as_bytes(), time, nonce_h, sign, "/data", &sid_str) {
+                return send_err(respond, 502, "bad auth").await;
+            }
+            // Replay protection (same as /connect)
+            if let Some(nonce_bytes) = hex::decode(nonce_h).ok().filter(|v| v.len() == 16) {
+                let mut arr = [0u8; 16];
+                arr.copy_from_slice(&nonce_bytes);
+                let mut nonces = state.nonces.lock().await;
+                if nonces.len() > 10_000 {
+                    nonces.retain(|(_, t)| t.elapsed() < std::time::Duration::from_secs(30));
+                }
+                if nonces.iter().any(|(n, _)| *n == arr) {
+                    return send_err(respond, 502, "replay").await;
+                }
+                nonces.push((arr, Instant::now()));
+            }
         }
 
         let session = { state.sessions.read().await.get(&sid).map(|s| s.target.clone()) };

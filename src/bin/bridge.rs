@@ -108,10 +108,13 @@ async fn handle(
     }
     info!("[{}] ClientHello {} bytes", target, fd.len());
 
-    // POST /connect with ClientHello body, end_stream=true
+    // POST /connect with ClientHello body + HMAC auth
+    let (time, nonce, sign) = hmac_sign(password.as_bytes(), "/connect", "");
     let req = http::Request::builder().method("POST")
         .uri(format!("https://{}/connect?target={}", server_name, target))
-        .header("x-password", password)
+        .header("x-time", &time)
+        .header("x-nonce", &nonce)
+        .header("x-sign", &sign)
         .header("content-length", fd.len().to_string())
         .body(()).unwrap();
     let (resp_fut, mut send) = h2c.send_request(req, false)?;
@@ -154,9 +157,12 @@ async fn handle(
         data.truncate(n);
         loop { match tr.try_read(&mut more) { Ok(0)|Err(_) => break, Ok(n) => data.extend_from_slice(&more[..n]), } }
         info!("[{}] /data {} bytes", target, data.len());
+        let (time, nonce, sign) = hmac_sign(password.as_bytes(), "/data", &sid);
         let req = http::Request::builder().method("POST")
             .uri(format!("https://{}/data?id={}", server_name, sid))
-            .header("x-password", password)
+            .header("x-time", &time)
+            .header("x-nonce", &nonce)
+            .header("x-sign", &sign)
             .header("content-length", data.len().to_string())
             .body(()).unwrap();
         match h2c.send_request(req, false) {

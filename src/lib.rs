@@ -72,3 +72,58 @@ impl rustls::client::danger::ServerCertVerifier for NoopVerifier {
 pub fn resolve_password(cli: Option<&str>) -> String {
     cli.map(|s| s.to_string()).or_else(|| std::env::var("RUST_FORWARD_PASSWORD").ok()).unwrap_or_default()
 }
+
+// ===== HMAC authentication =====
+
+use hmac::{Hmac, Mac};
+use sha2::Sha256;
+use rand::Rng;
+use std::time::{SystemTime, UNIX_EPOCH};
+
+type HmacSha256 = Hmac<Sha256>;
+
+/// Generate HMAC-SHA256 signature headers
+pub fn hmac_sign(secret: &[u8], path: &str, session_id: &str) -> (String, String, String) {
+    let time = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let nonce: [u8; 16] = rand::thread_rng().gen();
+
+    let mut mac = HmacSha256::new_from_slice(secret).expect("HMAC: invalid key length");
+    mac.update(&time.to_be_bytes());
+    mac.update(&nonce);
+    mac.update(path.as_bytes());
+    mac.update(session_id.as_bytes());
+    let sign = mac.finalize().into_bytes();
+
+    (time.to_string(), hex::encode(nonce), hex::encode(sign))
+}
+
+/// Verify HMAC signature, returns true if valid
+pub fn hmac_verify(
+    secret: &[u8],
+    time_str: &str,
+    nonce_str: &str,
+    sign_str: &str,
+    path: &str,
+    session_id: &str,
+) -> bool {
+    let time: u128 = match time_str.parse() { Ok(t) => t, _ => return false };
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    // ±30s window
+    if time.abs_diff(now) > 30_000 { return false; }
+
+    let nonce = match hex::decode(nonce_str) { Ok(v) if v.len() == 16 => v, _ => return false };
+    let sign = match hex::decode(sign_str) { Ok(s) => s, _ => return false };
+
+    let mut mac = match HmacSha256::new_from_slice(secret) { Ok(m) => m, _ => return false };
+    mac.update(&time.to_be_bytes());
+    mac.update(&nonce);
+    mac.update(path.as_bytes());
+    mac.update(session_id.as_bytes());
+    mac.verify_slice(&sign).is_ok()
+}
