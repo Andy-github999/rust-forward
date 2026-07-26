@@ -1,15 +1,16 @@
 use anyhow::Result;
 use clap::Parser;
 use log::{error, info, warn};
-use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::{RwLock, Mutex};
+use tokio::sync::Mutex;
 use rust_forward::*;
 use bytes::Bytes;
+use dashmap::DashMap;
 
 type SessionId = u64;
 
@@ -23,34 +24,32 @@ struct Session {
     last_active: AtomicU64,
 }
 
-struct DnsCache {
-    cache: HashMap<String, SocketAddr>,
+/// Look up a host:port in the DashMap DNS cache; insert on miss.
+async fn resolve_dns(cache: &DashMap<String, SocketAddr>, target: &str) -> Result<SocketAddr> {
+    let (host, port) = if let Ok(addr) = target.parse::<SocketAddr>() {
+        return Ok(addr);
+    } else {
+        let (h, p) = target.rsplit_once(':').ok_or_else(|| anyhow::anyhow!("invalid target: {}", target))?;
+        (h.to_string(), p.parse::<u16>()?)
+    };
+    if let Some(addr) = cache.get(&host) {
+        return Ok(*addr);
+    }
+    let addrs = tokio::net::lookup_host((host.as_str(), port)).await?;
+    let v4 = addrs.filter(|a| a.is_ipv4()).next()
+        .ok_or_else(|| anyhow::anyhow!("no IPv4 for {}", target))?;
+    cache.insert(host, v4);
+    Ok(v4)
 }
 
-impl DnsCache {
-    async fn resolve(&mut self, target: &str) -> Result<SocketAddr> {
-        let (host, port) = if let Ok(addr) = target.parse::<SocketAddr>() {
-            return Ok(addr);
-        } else {
-            let (h, p) = target.rsplit_once(':').ok_or_else(|| anyhow::anyhow!("invalid target: {}", target))?;
-            (h.to_string(), p.parse::<u16>()?)
-        };
-        if let Some(addr) = self.cache.get(&host) {
-            return Ok(*addr);
-        }
-        let addrs = tokio::net::lookup_host((host.as_str(), port)).await?;
-        let v4 = addrs.filter(|a| a.is_ipv4()).next()
-            .ok_or_else(|| anyhow::anyhow!("no IPv4 for {}", target))?;
-        self.cache.insert(host, v4);
-        Ok(v4)
-    }
-
-    fn clear_host(&mut self, target: &str) {
-        if let Some((h, _)) = target.rsplit_once(':') {
-            self.cache.remove(h);
-        }
+/// Remove a host from the DNS cache on connection failure.
+fn dns_remove(cache: &DashMap<String, SocketAddr>, target: &str) {
+    if let Some((h, _)) = target.rsplit_once(':') {
+        cache.remove(h);
     }
 }
+
+
 
 struct AppState {
     password: String,
@@ -58,10 +57,14 @@ struct AppState {
     max_sessions: usize,
     idle_timeout: Duration,
     socks5_proxy: String,
-    sessions: RwLock<HashMap<SessionId, Arc<Session>>>,
+}
+
+/// Per-H2-connection state: domain-isolated, no locks between connections.
+struct ConnState {
+    sessions: DashMap<SessionId, Arc<Session>>,
     next_id: AtomicU64,
-    nonces: Mutex<Vec<([u8; 16], Instant)>>,
-    dns_cache: tokio::sync::Mutex<DnsCache>,
+    nonces: StdMutex<Vec<([u8; 16], Instant)>>,
+    dns_cache: DashMap<String, SocketAddr>,
 }
 
 #[derive(Parser, Debug)]
@@ -124,27 +127,7 @@ async fn main() -> Result<()> {
         max_sessions,
         idle_timeout,
         socks5_proxy,
-        sessions: RwLock::new(HashMap::new()),
-        next_id: AtomicU64::new(1),
-        nonces: Mutex::new(Vec::new()),
-        dns_cache: tokio::sync::Mutex::new(DnsCache { cache: HashMap::new() }),
     });
-    // Session idle cleanup
-    {
-        let st = state.clone();
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(st.idle_timeout / 2).await;
-                let mut sessions = st.sessions.write().await;
-                let before = sessions.len();
-                let deadline = now_ms() - st.idle_timeout.as_millis() as u64;
-                sessions.retain(|_, s| s.last_active.load(Ordering::Relaxed) >= deadline);
-                if sessions.len() != before {
-                    info!("session cleanup: {} -> {}", before, sessions.len());
-                }
-            }
-        });
-    }
 
     loop {
         match lis.accept().await {
@@ -178,11 +161,36 @@ async fn serve_h2(
         .await?;
     info!("H2 connection established");
 
+    let conn = Arc::new(ConnState {
+        sessions: DashMap::new(),
+        next_id: AtomicU64::new(1),
+        nonces: StdMutex::new(Vec::new()),
+        dns_cache: DashMap::new(),
+    });
+
+    // Per-connection session idle cleanup
+    {
+        let conn = conn.clone();
+        let idle_timeout = state.idle_timeout;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(idle_timeout / 2).await;
+                let before = conn.sessions.len();
+                let deadline = now_ms() - idle_timeout.as_millis() as u64;
+                conn.sessions.retain(|_, s| s.last_active.load(Ordering::Relaxed) >= deadline);
+                if conn.sessions.len() != before {
+                    info!("session cleanup: {} -> {}", before, conn.sessions.len());
+                }
+            }
+        });
+    }
+
     while let Some(result) = h2.accept().await {
         let (req, respond) = result?;
         let st = state.clone();
+        let cn = conn.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_stream(req, respond, &st).await {
+            if let Err(e) = handle_stream(req, respond, &st, &cn).await {
                 warn!("stream: {}", e);
             }
         });
@@ -194,6 +202,7 @@ async fn handle_stream(
     request: http::Request<h2::RecvStream>,
     mut respond: h2::server::SendResponse<Bytes>,
     state: &AppState,
+    conn: &ConnState,
 ) -> Result<()> {
     let (head, mut body) = request.into_parts();
     let path = head.uri.path_and_query()
@@ -231,16 +240,23 @@ async fn handle_stream(
             if let Some(nonce_bytes) = hex::decode(nonce_h).ok().filter(|v| v.len() == 16) {
                 let mut arr = [0u8; 16];
                 arr.copy_from_slice(&nonce_bytes);
-                let mut nonces = state.nonces.lock().await;
-                // lazy cleanup: remove expired entries
-                if nonces.len() > 10_000 {
-                    nonces.retain(|(_, t)| t.elapsed() < std::time::Duration::from_secs(30));
-                }
-                // check for duplicate
-                if nonces.iter().any(|(n, _)| *n == arr) {
+                let is_replay = {
+                    let mut nonces = conn.nonces.lock().unwrap();
+                    // lazy cleanup: remove expired entries
+                    if nonces.len() > 10_000 {
+                        nonces.retain(|(_, t)| t.elapsed() < std::time::Duration::from_secs(30));
+                    }
+                    // check for duplicate
+                    if nonces.iter().any(|(n, _)| *n == arr) {
+                        true
+                    } else {
+                        nonces.push((arr, Instant::now()));
+                        false
+                    }
+                }; // StdMutexGuard dropped here
+                if is_replay {
                     return send_err(respond, 502, "replay").await;
                 }
-                nonces.push((arr, Instant::now()));
             }
         }
 
@@ -260,12 +276,8 @@ async fn handle_stream(
                 Err(e) => return send_err(respond, 502, &format!("socks5: {}", e)).await,
             }
         } else {
-            // Resolve target via DNS cache, then TCP connect
-            let resolved = {
-                let mut dns = state.dns_cache.lock().await;
-                dns.resolve(&target).await
-            };
-            let target_addr = match resolved {
+            // Resolve target via DashMap DNS cache (lock-free per-shard)
+            let target_addr = match resolve_dns(&conn.dns_cache, &target).await {
                 Ok(addr) => addr,
                 Err(e) => { return send_err(respond, 502, &format!("dns: {}", e)).await; }
             };
@@ -277,11 +289,11 @@ async fn handle_stream(
             ).await {
                 Ok(Ok(s)) => s,
                 Ok(Err(e)) => {
-                    state.dns_cache.lock().await.clear_host(&target);
+                    dns_remove(&conn.dns_cache, &target);
                     return send_err(respond, 502, &format!("connect: {}", e)).await;
                 }
                 Err(_) => {
-                    state.dns_cache.lock().await.clear_host(&target);
+                    dns_remove(&conn.dns_cache, &target);
                     return send_err(respond, 504, "timeout").await;
                 }
             }
@@ -307,18 +319,15 @@ async fn handle_stream(
         if resp_data.is_empty() { return send_err(respond, 504, "no response").await; }
 
         // Check session limit
-        {
-            let sessions = state.sessions.read().await;
-            if sessions.len() >= state.max_sessions {
-                info!("session limit reached ({})", state.max_sessions);
-                return send_err(respond, 503, "too many sessions").await;
-            }
+        if conn.sessions.len() >= state.max_sessions {
+            info!("session limit reached ({})", state.max_sessions);
+            return send_err(respond, 503, "too many sessions").await;
         }
 
         // Store session
-        let sid = state.next_id.fetch_add(1, Ordering::Relaxed);
-        let tgt = Arc::new(tokio::sync::Mutex::new(target_stream));
-        state.sessions.write().await.insert(sid, Arc::new(Session {
+        let sid = conn.next_id.fetch_add(1, Ordering::Relaxed);
+        let tgt = Arc::new(Mutex::new(target_stream));
+        conn.sessions.insert(sid, Arc::new(Session {
             target: tgt,
             last_active: AtomicU64::new(now_ms()),
         }));
@@ -353,18 +362,25 @@ async fn handle_stream(
             if let Some(nonce_bytes) = hex::decode(nonce_h).ok().filter(|v| v.len() == 16) {
                 let mut arr = [0u8; 16];
                 arr.copy_from_slice(&nonce_bytes);
-                let mut nonces = state.nonces.lock().await;
-                if nonces.len() > 10_000 {
-                    nonces.retain(|(_, t)| t.elapsed() < std::time::Duration::from_secs(30));
-                }
-                if nonces.iter().any(|(n, _)| *n == arr) {
+                let is_replay = {
+                    let mut nonces = conn.nonces.lock().unwrap();
+                    if nonces.len() > 10_000 {
+                        nonces.retain(|(_, t)| t.elapsed() < std::time::Duration::from_secs(30));
+                    }
+                    if nonces.iter().any(|(n, _)| *n == arr) {
+                        true
+                    } else {
+                        nonces.push((arr, Instant::now()));
+                        false
+                    }
+                }; // StdMutexGuard dropped here
+                if is_replay {
                     return send_err(respond, 502, "replay").await;
                 }
-                nonces.push((arr, Instant::now()));
             }
         }
 
-        let session = state.sessions.read().await.get(&sid).cloned();
+        let session = conn.sessions.get(&sid).map(|r| r.clone());
         match session {
             Some(s) => {
                 let tm = s.target.clone();
