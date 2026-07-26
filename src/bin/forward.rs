@@ -424,7 +424,7 @@ async fn handle_stream(
             }
             None => {
                 warn!("[/data] [sid={}] session not found", sid);
-                return send_err(respond, 404, "session not found").await;
+                return send_err(respond, 410, "session gone").await;
             }
         }
         return Ok(());

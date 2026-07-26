@@ -24,6 +24,9 @@ struct Args {
     buf_size: usize,
     #[arg(long)]
     cf_ip: Option<String>,
+    /// Max time (seconds) to wait for a single /connect or /data H2 round-trip.
+    #[arg(long, default_value = "30")]
+    request_timeout: u64,
 }
 
 fn resolve_connect(cli: Option<&str>) -> String {
@@ -51,13 +54,40 @@ async fn main() {
     let s2 = args.server_name.clone();
     let s3 = args.insecure;
     let s4 = ca.clone();
+    // Initial connect — synchronously wait before accepting any SOCKS5 connection
+    info!("Initial H2 connect to {}...", ca);
+    let (init_h2, init_conn) = loop {
+        match connect_h2(&ca, &s2, s3).await {
+            Ok((h2, conn)) => { info!("Initial H2 connected"); break (h2, conn); }
+            Err(e) => { error!("Initial H2 connect failed: {} (retry in 5s)", e); }
+        }
+        tokio::time::sleep(Duration::from_secs(5)).await;
+    };
+    tx.send(Some(init_h2)).ok();
+    // Background: poll connection health; reconnect when it drops OR every 30s to
+    // avoid getting stuck on a half-dead connection.
     tokio::spawn(async move {
+        let mut conn = init_conn;
         loop {
-            match connect_h2(&s4, &s2, s3).await {
-                Ok(c) => { tx_reconnect.send(Some(c)).ok(); }
-                Err(e) => { error!("H2 connect: {}", e); }
+            tokio::select! {
+                _ = &mut conn => {
+                    info!("H2 connection dropped, reconnecting...");
+                }
+                _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                    // Time-based refresh: prevent hanging on a stale connection
+                    info!("H2 periodic refresh...");
+                }
             }
-            tokio::time::sleep(Duration::from_secs(5)).await;
+            match connect_h2(&s4, &s2, s3).await {
+                Ok((h2, new_conn)) => {
+                    tx_reconnect.send(Some(h2)).ok();
+                    conn = new_conn;
+                }
+                Err(e) => {
+                    error!("H2 reconnect failed: {} (retry in 5s)", e);
+                    tokio::time::sleep(Duration::from_secs(5)).await;
+                }
+            }
         }
     });
     let la: SocketAddr = args.listen.parse().expect("addr");
@@ -70,8 +100,9 @@ async fn main() {
                 let rx = rx.clone();
                 let sn = args.server_name.clone();
                 let pw = password.clone();
+                let req_to = Duration::from_secs(args.request_timeout);
                 tokio::spawn(async move {
-                    if let Err(e) = handle(tcp, addr, rx, &sn, &pw).await {
+                    if let Err(e) = handle(tcp, addr, rx, &sn, &pw, req_to).await {
                         warn!("[{}] {}", addr, e);
                     }
                 });
@@ -85,6 +116,7 @@ async fn handle(
     mut tcp: tokio::net::TcpStream, addr: SocketAddr,
     mut rx: watch::Receiver<Option<h2::client::SendRequest<Bytes>>>,
     server_name: &str, password: &str,
+    req_to: Duration,
 ) -> anyhow::Result<()> {
     let start = Instant::now();
     let mut buf = [0u8; 300];
@@ -126,9 +158,40 @@ async fn handle(
         .header("content-length", fd.len().to_string())
         .body(()).unwrap();
     let (resp_fut, mut send) = h2c.send_request(req, false)?;
-    send.send_data(Bytes::from(fd), true)?;
+    send.send_data(Bytes::from(fd.clone()), true)?;
 
-    let resp = resp_fut.await?;
+    let resp = 'connect: loop {
+        match tokio::time::timeout(req_to, resp_fut).await {
+            Ok(Ok(r)) => break 'connect r,
+            Ok(Err(e)) => {
+                warn!("[{}] /connect H2 err: {} (retry once)", target, e);
+                // Get fresh H2 client and retry
+                let mut h2c2 = match rx.borrow_and_update().clone() {
+                    Some(c) => c, None => { return Ok(()); }
+                };
+                let (t2, n2, s2) = hmac_sign(password.as_bytes(), "/tunnel/connect", "");
+                let req2 = http::Request::builder().method("POST")
+                    .uri(format!("https://{}/tunnel/connect", server_name))
+                    .header("x-target", &target)
+                    .header("x-time", &t2)
+                    .header("x-nonce", &n2)
+                    .header("x-sign", &s2)
+                    .header("content-length", fd.len().to_string())
+                    .body(()).unwrap();
+                let (rf2, mut sd2) = match h2c2.send_request(req2, false) {
+                    Ok(pair) => pair,
+                    Err(e2) => { warn!("[{}] /connect retry send failed: {}", target, e2); return Ok(()); }
+                };
+                sd2.send_data(Bytes::from(fd), true)?;
+                match tokio::time::timeout(req_to, rf2).await {
+                    Ok(Ok(r)) => break 'connect r,
+                    Ok(Err(e2)) => { warn!("[{}] /connect retry err: {}", target, e2); return Ok(()); }
+                    Err(_) => { warn!("[{}] /connect retry timeout", target); return Ok(()); }
+                }
+            }
+            Err(_) => { return Err(anyhow::anyhow!("/connect timeout")); }
+        }
+    };
     let status = resp.status();
     if status != 200 {
         let (_, mut eb) = resp.into_parts();
@@ -144,14 +207,20 @@ async fn handle(
         .to_string();
     let (_, mut recv_body) = resp.into_parts();
     let mut total = 0usize;
-    while let Some(Ok(chunk)) = recv_body.data().await {
-        let n = chunk.len();
-        if total == 0 && n > 0 {
-            info!("[{}] /connect body first bytes: {:02x?}", target, &chunk[..n.min(32)]);
+    loop {
+        match tokio::time::timeout(req_to, recv_body.data()).await {
+            Ok(Some(Ok(chunk))) => {
+                let n = chunk.len();
+                if total == 0 && n > 0 {
+                    info!("[{}] /connect body first bytes: {:02x?}", target, &chunk[..n.min(32)]);
+                }
+                total += n;
+                if tcp.write_all(&chunk).await.is_err() { return Ok(()); }
+                let _ = recv_body.flow_control().release_capacity(n);
+            }
+            Ok(Some(Err(_))) | Ok(None) => break,
+            Err(_) => { warn!("[{}] /connect body timeout after {} bytes", target, total); break; }
         }
-        total += n;
-        if tcp.write_all(&chunk).await.is_err() { return Ok(()); }
-        let _ = recv_body.flow_control().release_capacity(n);
     }
     info!("[{}] /connect body total: {} bytes (sid={})", target, total, sid);
 
@@ -175,18 +244,79 @@ async fn handle(
             .header("x-sign", &sign)
             .header("content-length", data.len().to_string())
             .body(()).unwrap();
+        let data_bytes = Bytes::from(std::mem::take(&mut data));
         match h2c.send_request(req, false) {
             Ok((rf, mut st)) => {
-                st.send_data(Bytes::from(std::mem::take(&mut data)), true)?;
-                match rf.await {
-                    Ok(r) => {
+                st.send_data(data_bytes.clone(), true)?;
+                match tokio::time::timeout(req_to, rf).await {
+                    Ok(Ok(r)) => {
+                        let status = r.status();
+                        if status != 200 {
+                            let (_, mut eb) = r.into_parts();
+                            let mut et = String::new();
+                            while let Some(Ok(c)) = eb.data().await { et.push_str(&String::from_utf8_lossy(&c)); }
+                            warn!("[{}] /data status {}: {}", target, status, et);
+                            break;
+                        }
                         let (_, mut bd) = r.into_parts();
-                        while let Some(Ok(c)) = bd.data().await {
-                            if tw.write_all(&c).await.is_err() { break; }
-                            let _ = bd.flow_control().release_capacity(c.len());
+                        loop {
+                            match tokio::time::timeout(req_to, bd.data()).await {
+                                Ok(Some(Ok(c))) => {
+                                    if tw.write_all(&c).await.is_err() { break; }
+                                    let _ = bd.flow_control().release_capacity(c.len());
+                                }
+                                Ok(Some(Err(_))) | Ok(None) => break,
+                                Err(_) => { warn!("[{}] /data body timeout", target); break; }
+                            }
                         }
                     }
-                    Err(e) => { warn!("[{}] /data err: {}", target, e); break; }
+                    Ok(Err(e)) => {
+                        warn!("[{}] /data response err (retry once): {}", target, e);
+                        let mut h2c2 = match rx.borrow_and_update().clone() {
+                            Some(c) => c, None => break,
+                        };
+                        let (t2, n2, s2) = hmac_sign(password.as_bytes(), "/tunnel/data", &sid);
+                        let req2 = http::Request::builder().method("POST")
+                            .uri(format!("https://{}/tunnel/data", server_name))
+                            .header("x-session-id", &sid)
+                            .header("x-time", &t2)
+                            .header("x-nonce", &n2)
+                            .header("x-sign", &s2)
+                            .header("content-length", data_bytes.len().to_string())
+                            .body(()).unwrap();
+                        match h2c2.send_request(req2, false) {
+                            Ok((rf2, mut sd2)) => {
+                                sd2.send_data(data_bytes, true)?;
+                                match tokio::time::timeout(req_to, rf2).await {
+                                    Ok(Ok(r2)) => {
+                                        let status2 = r2.status();
+                                        if status2 != 200 {
+                                            let (_, mut eb) = r2.into_parts();
+                                            let mut et = String::new();
+                                            while let Some(Ok(c)) = eb.data().await { et.push_str(&String::from_utf8_lossy(&c)); }
+                                            warn!("[{}] /data retry status {}: {}", target, status2, et);
+                                            break;
+                                        }
+                                        let (_, mut bd) = r2.into_parts();
+                                        loop {
+                                            match tokio::time::timeout(req_to, bd.data()).await {
+                                                Ok(Some(Ok(c))) => {
+                                                    if tw.write_all(&c).await.is_err() { break; }
+                                                    let _ = bd.flow_control().release_capacity(c.len());
+                                                }
+                                                Ok(Some(Err(_))) | Ok(None) => break,
+                                                Err(_) => { warn!("[{}] /data retry body timeout", target); break; }
+                                            }
+                                        }
+                                    }
+                                    Ok(Err(e2)) => { warn!("[{}] /data retry err: {}", target, e2); break; }
+                                    Err(_) => { warn!("[{}] /data retry timeout", target); break; }
+                                }
+                            }
+                            Err(e2) => { warn!("[{}] /data retry send failed: {}", target, e2); break; }
+                        }
+                    }
+                    Err(_) => { warn!("[{}] /data response timeout", target); break; }
                 }
             }
             Err(e) => { warn!("[{}] /data send: {}", target, e); break; }
@@ -196,7 +326,9 @@ async fn handle(
     info!("[{}] DONE: {:.1}s", target, elapsed.as_secs_f64());
     Ok(())
 }
-async fn connect_h2(addr: &str, server_name: &str, _insecure: bool) -> Result<h2::client::SendRequest<Bytes>, anyhow::Error> {
+type H2Conn = h2::client::Connection<tokio_rustls::client::TlsStream<tokio::net::TcpStream>, Bytes>;
+
+async fn connect_h2(addr: &str, server_name: &str, _insecure: bool) -> anyhow::Result<(h2::client::SendRequest<Bytes>, H2Conn)> {
     use std::sync::Arc;
     use tokio::net::TcpStream;
     use tokio_rustls::{TlsConnector, rustls::ClientConfig};
@@ -222,7 +354,6 @@ async fn connect_h2(addr: &str, server_name: &str, _insecure: bool) -> Result<h2
         .initial_window_size(4_194_304)
         .initial_connection_window_size(33_554_432)
         .handshake(tls).await?;
-    tokio::spawn(async move { let _ = conn.await; });
     info!("H2 connected to {}", addr);
-    Ok(h2)
+    Ok((h2, conn))
 }
