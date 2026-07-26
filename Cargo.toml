@@ -31,6 +31,11 @@ hex = "0.4"
 rand = "0.8"
 tokio-socks = "0.5"
 dashmap = "6"
+
+[features]
+default = ["logging"]
+logging = []
+
 [profile.release]
 lto = "fat"
 codegen-units = 1
