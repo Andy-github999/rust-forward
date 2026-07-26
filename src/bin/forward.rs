@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
+use std::fs;
 use tracing::{error, info, warn};
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -106,15 +107,15 @@ struct AppState {
     max_sessions: usize,
     idle_timeout: Duration,
     socks5_proxy: String,
-}
-
-/// Per-H2-connection state: domain-isolated, no locks between connections.
-struct ConnState {
     sessions: DashMap<SessionId, Arc<Session>>,
     next_id: AtomicU64,
+    dns_cache: DashMap<String, DnsEntry>,
+}
+
+/// Per-H2-connection state: nonces for replay protection only.
+struct ConnState {
     nonces: StdMutex<Vec<([u8; 16], Instant)>>,
     max_nonces: usize,
-    dns_cache: DashMap<String, DnsEntry>,
 }
 
 #[derive(Parser, Debug)]
@@ -124,6 +125,12 @@ struct Args {
     listen: String,
     #[arg(long)]
     password: Option<String>,
+    /// Path to TLS certificate file (PEM). If omitted, generates self-signed.
+    #[arg(long)]
+    cert: Option<String>,
+    /// Path to TLS private key file (PEM). Required if --cert is set.
+    #[arg(long)]
+    key: Option<String>,
     #[arg(long, default_value = "10")]
     connect_timeout: u64,
     #[arg(long, default_value = "1024")]
@@ -138,6 +145,8 @@ struct Args {
 #[tokio::main]
 async fn main() -> Result<()> {
     tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_target(false)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
@@ -149,14 +158,30 @@ async fn main() -> Result<()> {
 
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    // Generate self-signed cert for H2
-    info!("Generating self-signed TLS certificate...");
-    let cert_rcgen = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()])?;
-    let cert_der = rustls::pki_types::CertificateDer::from(cert_rcgen.cert.der().to_vec());
-    let key_raw = cert_rcgen.key_pair.serialize_der();
-    let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(
-        rustls::pki_types::PrivatePkcs8KeyDer::from(key_raw),
-    );
+    // Load TLS certificate (from file or self-signed)
+    let (cert_der, key_der) = if let (Some(cert_path), Some(key_path)) = (&args.cert, &args.key) {
+        info!("Loading TLS cert from {} and key from {}", cert_path, key_path);
+        let certs = rustls_pemfile::certs(&mut std::io::BufReader::new(fs::File::open(cert_path)?))
+            .collect::<Result<Vec<_>, _>>()?;
+        let key_raw = rustls_pemfile::private_key(&mut std::io::BufReader::new(fs::File::open(key_path)?))?
+            .ok_or_else(|| anyhow::anyhow!("no private key found in {}", key_path))?;
+        let key_der = match key_raw {
+            rustls::pki_types::PrivateKeyDer::Pkcs8(k) => {
+                rustls::pki_types::PrivateKeyDer::Pkcs8(k)
+            }
+            other => anyhow::bail!("unsupported key format: {:?}", other.secret_der()),
+        };
+        (certs.into_iter().next().ok_or_else(|| anyhow::anyhow!("no cert found"))?, key_der)
+    } else {
+        info!("Generating self-signed TLS certificate...");
+        let cert_rcgen = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()])?;
+        let der = rustls::pki_types::CertificateDer::from(cert_rcgen.cert.der().to_vec());
+        let key_raw = cert_rcgen.key_pair.serialize_der();
+        let key = rustls::pki_types::PrivateKeyDer::Pkcs8(
+            rustls::pki_types::PrivatePkcs8KeyDer::from(key_raw),
+        );
+        (der, key)
+    };
 
     let mut server_cfg = rustls::ServerConfig::builder_with_provider(
         rustls::crypto::ring::default_provider().into()
@@ -181,6 +206,9 @@ async fn main() -> Result<()> {
         max_sessions,
         idle_timeout,
         socks5_proxy,
+        sessions: DashMap::new(),
+        next_id: AtomicU64::new(1),
+        dns_cache: DashMap::new(),
     });
 
     loop {
@@ -193,6 +221,9 @@ async fn main() -> Result<()> {
                         Ok(s) => s,
                         Err(e) => { warn!("[{}] TLS: {}", peer, e); return; }
                     };
+                    // Log the ALPN negotiated between Edge and forward
+                    let alpn = tls_stream.get_ref().1.alpn_protocol().map(|v| String::from_utf8_lossy(v).to_string());
+                    info!("[{}] TLS established, ALPN: {:?}, Edge→forward protocol: {}", peer, alpn, alpn.as_deref().unwrap_or("unknown"));
                     if let Err(e) = serve_h2(tokio_rustls::TlsStream::Server(tls_stream), st).await {
                         warn!("[{}] H2: {}", peer, e);
                     }
@@ -216,25 +247,36 @@ async fn serve_h2(
     info!("H2 connection established");
 
     let conn = Arc::new(ConnState {
-        sessions: DashMap::new(),
-        next_id: AtomicU64::new(1),
         nonces: StdMutex::new(Vec::new()),
         max_nonces: 10_000,
-        dns_cache: DashMap::new(),
     });
 
-    // Per-connection session idle cleanup
+    // Global session idle cleanup
     {
-        let conn = conn.clone();
+        let sessions = state.sessions.clone();
         let idle_timeout = state.idle_timeout;
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(idle_timeout / 2).await;
-                let before = conn.sessions.len();
+                let before = sessions.len();
                 let deadline = now_ms() - idle_timeout.as_millis() as u64;
-                conn.sessions.retain(|_, s| s.last_active.load(Ordering::Relaxed) >= deadline);
-                if conn.sessions.len() != before {
-                    info!("session cleanup: {} -> {}", before, conn.sessions.len());
+                sessions.retain(|_, s| s.last_active.load(Ordering::Relaxed) >= deadline);
+                if sessions.len() != before {
+                    info!("session cleanup: {} -> {}", before, sessions.len());
+                }
+            }
+        });
+    }
+
+    // H2 keepalive: send PING every 20s to prevent Cloudflare Edge from timing out
+    let ping_handle = h2.ping_pong();
+    if let Some(mut ping_pong) = ping_handle {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(20)).await;
+                if ping_pong.ping(h2::Ping::opaque()).await.is_err() {
+                    info!("H2 keepalive PING failed, connection may be dead");
+                    break;
                 }
             }
         });
@@ -306,7 +348,7 @@ async fn handle_stream(
             }
         } else {
             // Resolve target via DashMap DNS cache (lock-free per-shard)
-            let target_addr = match resolve_dns(&conn.dns_cache, &target).await {
+            let target_addr = match resolve_dns(&state.dns_cache, &target).await {
                 Ok(addr) => addr,
                 Err(e) => { return send_err(respond, 502, &format!("dns: {}", e)).await; }
             };
@@ -318,11 +360,11 @@ async fn handle_stream(
             ).await {
                 Ok(Ok(s)) => s,
                 Ok(Err(e)) => {
-                    dns_remove(&conn.dns_cache, &target);
+                    dns_remove(&state.dns_cache, &target);
                     return send_err(respond, 502, &format!("connect: {}", e)).await;
                 }
                 Err(_) => {
-                    dns_remove(&conn.dns_cache, &target);
+                    dns_remove(&state.dns_cache, &target);
                     return send_err(respond, 504, "timeout").await;
                 }
             }
@@ -331,25 +373,25 @@ async fn handle_stream(
         // Write ClientHello
         if !helo.is_empty() { target_stream.write_all(&helo).await?; }
 
-        // Read ServerHello from target (idle-batched: 10s first byte, 200ms idle between chunks)
+        // Read ServerHello from target (idle-batched: 10s first byte, 50ms idle between chunks)
         let resp_data = read_until_idle(
             &mut target_stream,
             Duration::from_secs(10),
-            Duration::from_millis(200),
+            Duration::from_millis(50),
         ).await;
         info!("[/connect] [{}] read {} bytes from target", target, resp_data.len());
         if resp_data.is_empty() { return send_err(respond, 504, "no response").await; }
 
         // Check session limit
-        if conn.sessions.len() >= state.max_sessions {
+        if state.sessions.len() >= state.max_sessions {
             info!("session limit reached ({})", state.max_sessions);
             return send_err(respond, 503, "too many sessions").await;
         }
 
         // Store session
-        let sid = conn.next_id.fetch_add(1, Ordering::Relaxed);
+        let sid = state.next_id.fetch_add(1, Ordering::Relaxed);
         let tgt = Arc::new(Mutex::new(target_stream));
-        conn.sessions.insert(sid, Arc::new(Session {
+        state.sessions.insert(sid, Arc::new(Session {
             target: tgt,
             last_active: AtomicU64::new(now_ms()),
         }));
@@ -378,7 +420,7 @@ async fn handle_stream(
             return send_err(respond, 502, msg).await;
         }
 
-        let session = conn.sessions.get(&sid).map(|r| r.clone());
+        let session = state.sessions.get(&sid).map(|r| r.clone());
         match session {
             Some(s) => {
                 let tm = s.target.clone();

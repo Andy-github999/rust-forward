@@ -36,6 +36,8 @@ fn resolve_connect(cli: Option<&str>) -> String {
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
+        .with_ansi(false)
+        .with_target(false)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
@@ -231,6 +233,12 @@ async fn handle(
         let mut et = String::new();
         while let Some(Ok(c)) = eb.data().await { et.push_str(&String::from_utf8_lossy(&c)); }
         warn!("[{}] /connect {}: {}", target, status, et);
+        // RST close to prevent Chrome ERR_SSL_PROTOCOL_ERROR
+        if let Ok(std) = tcp.into_std() {
+            use socket2::SockRef;
+            let s2 = SockRef::from(&std);
+            let _ = s2.set_linger(Some(std::time::Duration::from_secs(0)));
+        }
         return Ok(());
     }
     // Read ServerHello from response body, extract session id
