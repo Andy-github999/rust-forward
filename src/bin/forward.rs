@@ -260,9 +260,9 @@ async fn handle_stream(
             }
         }
 
-        // Read ClientHello from body
+        // Read ClientHello from body (loop over all H2 DATA frames)
         let mut helo = Vec::new();
-        if let Some(Ok(chunk)) = body.data().await {
+        while let Some(Ok(chunk)) = body.data().await {
             helo.extend_from_slice(&chunk);
             let _ = body.flow_control().release_capacity(chunk.len());
         }
