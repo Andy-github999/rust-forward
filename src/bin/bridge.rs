@@ -1,14 +1,11 @@
 use clap::Parser;
 use log::{error, info, warn};
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::sync::RwLock;
+use tokio::sync::watch;
 use rust_forward::*;
 use bytes::Bytes;
-
-type SharedH2Client = Arc<RwLock<Option<h2::client::SendRequest<Bytes>>>>;
 
 #[derive(Parser, Debug)]
 #[command(name = "bridge", about = "SOCKS5 → H2 bridge for PC")]
@@ -49,15 +46,15 @@ async fn main() {
     } else {
         format!("{}:{}", ch, port)
     };
-    let shared: SharedH2Client = Arc::new(RwLock::new(None));
-    let s1 = shared.clone();
+    let (tx, rx) = watch::channel(None::<h2::client::SendRequest<Bytes>>);
+    let tx_reconnect = tx.clone();
     let s2 = args.server_name.clone();
     let s3 = args.insecure;
     let s4 = ca.clone();
     tokio::spawn(async move {
         loop {
             match connect_h2(&s4, &s2, s3).await {
-                Ok(c) => { *s1.write().await = Some(c); }
+                Ok(c) => { tx_reconnect.send(Some(c)).ok(); }
                 Err(e) => { error!("H2 connect: {}", e); }
             }
             tokio::time::sleep(Duration::from_secs(5)).await;
@@ -70,11 +67,11 @@ async fn main() {
     loop {
         match lis.accept().await {
             Ok((tcp, addr)) => {
-                let s = shared.clone();
+                let rx = rx.clone();
                 let sn = args.server_name.clone();
                 let pw = password.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle(tcp, addr, &s, &sn, &pw).await {
+                    if let Err(e) = handle(tcp, addr, rx, &sn, &pw).await {
                         warn!("[{}] {}", addr, e);
                     }
                 });
@@ -86,7 +83,8 @@ async fn main() {
 
 async fn handle(
     mut tcp: tokio::net::TcpStream, addr: SocketAddr,
-    shared: &SharedH2Client, server_name: &str, password: &str,
+    mut rx: watch::Receiver<Option<h2::client::SendRequest<Bytes>>>,
+    server_name: &str, password: &str,
 ) -> anyhow::Result<()> {
     let start = Instant::now();
     let mut buf = [0u8; 300];
@@ -101,8 +99,8 @@ async fn handle(
         _ => return Ok(()),
     };
     info!("[{}] CONNECT from {}", target, addr);
-    let mut h2c = match shared.read().await.as_ref() {
-        Some(c) => c.clone(), None => { warn!("[{}] H2 down", target); return Ok(()); }
+    let mut h2c = match rx.borrow_and_update().clone() {
+        Some(c) => c, None => { warn!("[{}] H2 down", target); return Ok(()); }
     };
     tcp.write_all(&[0x05,0x00,0x00,0x01,0,0,0,0,0,0]).await?;
 
