@@ -195,7 +195,7 @@ async fn handle(
     info!("[{}] DONE: {:.1}s", target, elapsed.as_secs_f64());
     Ok(())
 }
-async fn connect_h2(addr: &str, server_name: &str, insecure: bool) -> Result<h2::client::SendRequest<Bytes>, anyhow::Error> {
+async fn connect_h2(addr: &str, server_name: &str, _insecure: bool) -> Result<h2::client::SendRequest<Bytes>, anyhow::Error> {
     use std::sync::Arc;
     use tokio::net::TcpStream;
     use tokio_rustls::{TlsConnector, rustls::ClientConfig};

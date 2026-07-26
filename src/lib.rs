@@ -1,8 +1,9 @@
 use anyhow::Result;
 use std::net::SocketAddr;
 use std::time::Duration;
+use tokio::net::TcpStream;
 
-pub async fn connect_tcp_v4(target: &str, timeout_secs: u64) -> Result<tokio::net::TcpStream> {
+pub async fn connect_tcp_v4(target: &str, timeout_secs: u64) -> Result<TcpStream> {
     let (host, port) = if let Ok(addr) = target.parse::<SocketAddr>() {
         (addr.ip().to_string(), addr.port())
     } else {
@@ -28,6 +29,33 @@ pub async fn connect_tcp_v4(target: &str, timeout_secs: u64) -> Result<tokio::ne
         Err(e) => return Err(anyhow::anyhow!("into_std: {}", e)),
     };
     Ok(stream)
+}
+
+/// Connect to a target through a SOCKS5 proxy.
+/// Returns a raw TcpStream (SOCKS5 CONNECT handshake already completed).
+pub async fn connect_via_socks5(
+    proxy: &str,
+    target: &str,
+    timeout_secs: u64,
+) -> Result<TcpStream> {
+    let stream = tokio::time::timeout(
+        Duration::from_secs(timeout_secs),
+        tokio_socks::tcp::socks5::Socks5Stream::connect(proxy, target),
+    ).await??;
+    // SOCKS5 handshake done → extract inner TcpStream (all further data is application)
+    let inner = stream.into_inner();
+
+    // TCP keepalive via socket2 (15s interval)
+    match inner.into_std() {
+        Ok(std) => {
+            use socket2::{SockRef, TcpKeepalive};
+            let s2 = SockRef::from(&std);
+            let _ = s2.set_keepalive(true);
+            let _ = s2.set_tcp_keepalive(&TcpKeepalive::new().with_time(Duration::from_secs(15)));
+            Ok(TcpStream::from_std(std)?)
+        }
+        Err(e) => Err(anyhow::anyhow!("into_std: {}", e)),
+    }
 }
 
 #[derive(Debug)]

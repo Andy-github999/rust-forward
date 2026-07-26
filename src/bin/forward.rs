@@ -57,6 +57,7 @@ struct AppState {
     connect_timeout: u64,
     max_sessions: usize,
     idle_timeout: Duration,
+    socks5_proxy: String,
     sessions: RwLock<HashMap<SessionId, Session>>,
     next_id: AtomicU64,
     nonces: Mutex<Vec<([u8; 16], Instant)>>,
@@ -76,6 +77,9 @@ struct Args {
     max_sessions: usize,
     #[arg(long, default_value = "300")]
     idle_timeout: u64,
+    /// SOCKS5 proxy address (e.g., 192.168.2.1:1070). Empty = direct connect.
+    #[arg(long, default_value = "")]
+    socks5_proxy: String,
 }
 
 #[tokio::main]
@@ -113,11 +117,13 @@ async fn main() -> Result<()> {
     let max_sessions = args.max_sessions;
     let idle_timeout = Duration::from_secs(args.idle_timeout);
 
+    let socks5_proxy = args.socks5_proxy;
     let state = Arc::new(AppState {
         password,
         connect_timeout,
         max_sessions,
         idle_timeout,
+        socks5_proxy,
         sessions: RwLock::new(HashMap::new()),
         next_id: AtomicU64::new(1),
         nonces: Mutex::new(Vec::new()),
@@ -244,29 +250,38 @@ async fn handle_stream(
         }
         info!("[/connect] [{}] ClientHello {} bytes", target, helo.len());
 
-        // Resolve target via DNS cache, then TCP connect
-        let resolved = {
-            let mut dns = state.dns_cache.lock().await;
-            dns.resolve(&target).await
-        };
-        let target_addr = match resolved {
-            Ok(addr) => addr,
-            Err(e) => { return send_err(respond, 502, &format!("dns: {}", e)).await; }
-        };
-        info!("[/connect] [{}] resolved to {}", target, target_addr);
-        let ip_target = format!("{}:{}", target_addr.ip(), target_addr.port());
-        let mut target_stream = match tokio::time::timeout(
-            Duration::from_secs(state.connect_timeout),
-            connect_tcp_v4(&ip_target, state.connect_timeout),
-        ).await {
-            Ok(Ok(s)) => s,
-            Ok(Err(e)) => {
-                state.dns_cache.lock().await.clear_host(&target);
-                return send_err(respond, 502, &format!("connect: {}", e)).await;
+        // Connect to target (via SOCKS5 proxy or direct)
+        let mut target_stream = if !state.socks5_proxy.is_empty() {
+            info!("[/connect] [{}] via SOCKS5 {}", target, state.socks5_proxy);
+            match connect_via_socks5(&state.socks5_proxy, &target, state.connect_timeout).await {
+                Ok(s) => s,
+                Err(e) => return send_err(respond, 502, &format!("socks5: {}", e)).await,
             }
-            Err(_) => {
-                state.dns_cache.lock().await.clear_host(&target);
-                return send_err(respond, 504, "timeout").await;
+        } else {
+            // Resolve target via DNS cache, then TCP connect
+            let resolved = {
+                let mut dns = state.dns_cache.lock().await;
+                dns.resolve(&target).await
+            };
+            let target_addr = match resolved {
+                Ok(addr) => addr,
+                Err(e) => { return send_err(respond, 502, &format!("dns: {}", e)).await; }
+            };
+            info!("[/connect] [{}] resolved to {}", target, target_addr);
+            let ip_target = format!("{}:{}", target_addr.ip(), target_addr.port());
+            match tokio::time::timeout(
+                Duration::from_secs(state.connect_timeout),
+                connect_tcp_v4(&ip_target, state.connect_timeout),
+            ).await {
+                Ok(Ok(s)) => s,
+                Ok(Err(e)) => {
+                    state.dns_cache.lock().await.clear_host(&target);
+                    return send_err(respond, 502, &format!("connect: {}", e)).await;
+                }
+                Err(_) => {
+                    state.dns_cache.lock().await.clear_host(&target);
+                    return send_err(respond, 504, "timeout").await;
+                }
             }
         };
 
