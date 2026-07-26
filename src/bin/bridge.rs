@@ -216,7 +216,8 @@ async fn connect_h2(addr: &str, server_name: &str, insecure: bool) -> Result<h2:
     let tls = TlsConnector::from(cfg).connect(sn, tcp).await?;
     let (h2, conn) = h2::client::Builder::new()
         .max_concurrent_streams(256)
-        .initial_connection_window_size(16 * 1024 * 1024)
+        .initial_window_size(4_194_304)
+        .initial_connection_window_size(33_554_432)
         .handshake(tls).await?;
     tokio::spawn(async move { let _ = conn.await; });
     info!("H2 connected to {}", addr);

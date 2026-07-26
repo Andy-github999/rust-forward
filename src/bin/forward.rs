@@ -176,7 +176,8 @@ async fn serve_h2(
 ) -> Result<()> {
     let mut h2 = h2::server::Builder::new()
         .max_concurrent_streams(256)
-        .initial_connection_window_size(16 * 1024 * 1024)
+        .initial_window_size(4_194_304)
+        .initial_connection_window_size(33_554_432)
         .handshake(tls_stream)
         .await?;
     info!("H2 connection established");
