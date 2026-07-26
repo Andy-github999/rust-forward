@@ -1,0 +1,56 @@
+name: Build rust-forward
+
+on:
+  workflow_dispatch:
+    inputs:
+      password:
+        description: 'Override password (leave empty to use secret)'
+        required: false
+        type: string
+
+env:
+  RUST_FORWARD_PASSWORD: ${{ inputs.password || secrets.RUST_FORWARD_PASSWORD || '1' }}
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --release --bin bridge
+      - run: cargo build --release --bin forward
+      - uses: ncipollo/release-action@v1
+        with:
+          name: "Windows build ${{ github.run_id }}"
+          tag: win-${{ github.run_id }}
+          artifacts: |
+            target/release/bridge.exe
+            target/release/forward.exe
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  openwrt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-unknown-linux-musl
+      - name: Install zigbuild
+        run: pip3 install cargo-zigbuild
+      - uses: Swatinem/rust-cache@v2
+      - name: Build bridge
+        run: cargo zigbuild --release --target aarch64-unknown-linux-musl --bin bridge
+      - name: Build forward
+        run: cargo zigbuild --release --target aarch64-unknown-linux-musl --bin forward
+      - uses: ncipollo/release-action@v1
+        with:
+          name: "OpenWrt build ${{ github.run_id }}"
+          tag: openwrt-${{ github.run_id }}
+          artifacts: |
+            target/aarch64-unknown-linux-musl/release/bridge
+            target/aarch64-unknown-linux-musl/release/forward
+          token: ${{ secrets.GITHUB_TOKEN }}
