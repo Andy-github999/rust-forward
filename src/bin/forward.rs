@@ -1,6 +1,6 @@
 use anyhow::Result;
 use clap::Parser;
-use log::{error, info, warn};
+use tracing::{error, info, warn};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -62,14 +62,19 @@ fn dns_remove(cache: &DashMap<String, DnsEntry>, target: &str) {
 }
 
 /// Verify HMAC headers + replay protection for a request, in a single call.
-/// Returns Ok(()) if valid, or Err((status_code, message)) for the response.
+#[derive(Debug)]
+enum AuthError {
+    BadAuth,
+    Replay,
+}
+
 fn verify_hmac_request(
     conn: &ConnState,
     password: &str,
     headers: &http::HeaderMap,
     path: &str,
     session_id: &str,
-) -> std::result::Result<(), (u16, &'static str)> {
+) -> std::result::Result<(), AuthError> {
     if password.is_empty() {
         return Ok(());
     }
@@ -77,7 +82,7 @@ fn verify_hmac_request(
     let nonce_h = headers.get("x-nonce").and_then(|v| v.to_str().ok()).unwrap_or("");
     let sign = headers.get("x-sign").and_then(|v| v.to_str().ok()).unwrap_or("");
     if !hmac_verify(password.as_bytes(), time, nonce_h, sign, path, session_id) {
-        return Err((502, "bad auth"));
+        return Err(AuthError::BadAuth);
     }
     // Replay protection via nonce dedup
     if let Some(nonce_bytes) = hex::decode(nonce_h).ok().filter(|v| v.len() == 16) {
@@ -88,7 +93,7 @@ fn verify_hmac_request(
             nonces.retain(|(_, t)| t.elapsed() < Duration::from_secs(30));
         }
         if nonces.iter().any(|(n, _)| *n == arr) {
-            return Err((502, "replay"));
+            return Err(AuthError::Replay);
         }
         nonces.push((arr, Instant::now()));
     }
@@ -132,8 +137,12 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .format_timestamp_millis().init();
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+        )
+        .init();
     let args = Args::parse();
     let password = resolve_password(args.password.as_deref());
     let connect_timeout = args.connect_timeout;
@@ -274,9 +283,10 @@ async fn handle_stream(
             .unwrap_or("");
         if target.is_empty() { return send_err(respond, 400, "no target").await; }
 
-        // HMAC verification + replay protection (single helper call)
-        if let Err((code, msg)) = verify_hmac_request(conn, &state.password, &head.headers, "/tunnel/connect", "") {
-            return send_err(respond, code, msg).await;
+        // HMAC verification + replay protection (typed error)
+        if let Err(e) = verify_hmac_request(conn, &state.password, &head.headers, "/tunnel/connect", "") {
+            let msg = match e { AuthError::BadAuth => "bad auth", AuthError::Replay => "replay" };
+            return send_err(respond, 502, msg).await;
         }
 
         // Read ClientHello from body (loop over all H2 DATA frames)
@@ -361,10 +371,11 @@ async fn handle_stream(
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
 
-        // HMAC verification + replay protection (single helper call)
+        // HMAC verification + replay protection (typed error)
         let sid_str = sid.to_string();
-        if let Err((code, msg)) = verify_hmac_request(conn, &state.password, &head.headers, "/tunnel/data", &sid_str) {
-            return send_err(respond, code, msg).await;
+        if let Err(e) = verify_hmac_request(conn, &state.password, &head.headers, "/tunnel/data", &sid_str) {
+            let msg = match e { AuthError::BadAuth => "bad auth", AuthError::Replay => "replay" };
+            return send_err(respond, 502, msg).await;
         }
 
         let session = conn.sessions.get(&sid).map(|r| r.clone());
