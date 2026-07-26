@@ -15,15 +15,22 @@ path = "src/bin/forward.rs"
 tokio = { version = "1", features = ["full"] }
 rustls = { version = "0.23", default-features = false, features = ["ring"] }
 tokio-rustls = "0.26"
+rustls-pemfile = "2"
 anyhow = "1"
-log = "0.4"
-env_logger = "0.11"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive"] }
 h2 = "0.4"
 bytes = "1"
 http = "1"
 socket2 = "0.5"
 rcgen = "0.13"
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+rand = "0.8"
+tokio-socks = "0.5"
+dashmap = "6"
 [profile.release]
 lto = "fat"
 codegen-units = 1
