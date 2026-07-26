@@ -261,11 +261,12 @@ async fn handle(
 
     // /data loop
     let mut data = Vec::with_capacity(65536 + 8192);
+    let mut read_buf = vec![0u8; 65536];  // pre-allocated read buffer (zeroed once)
     let mut more = [0u8; 8192];
     loop {
-        data.resize(65536, 0);
-        let n = match tr.read(&mut data).await { Ok(0) => break, Ok(n) => n, Err(_) => break };
-        data.truncate(n);
+        let n = match tr.read(&mut read_buf).await { Ok(0) => break, Ok(n) => n, Err(_) => break };
+        data.clear();
+        data.extend_from_slice(&read_buf[..n]);
         loop { match tr.try_read(&mut more) { Ok(0)|Err(_) => break, Ok(n) => data.extend_from_slice(&more[..n]), } }
         info!("[{}] /data {} bytes", target, data.len());
         let (time, nonce, sign) = hmac_sign(password.as_bytes(), "/tunnel/data", &sid);
