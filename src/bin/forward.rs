@@ -58,7 +58,7 @@ struct AppState {
     max_sessions: usize,
     idle_timeout: Duration,
     socks5_proxy: String,
-    sessions: RwLock<HashMap<SessionId, Session>>,
+    sessions: RwLock<HashMap<SessionId, Arc<Session>>>,
     next_id: AtomicU64,
     nonces: Mutex<Vec<([u8; 16], Instant)>>,
     dns_cache: tokio::sync::Mutex<DnsCache>,
@@ -197,14 +197,17 @@ async fn handle_stream(
 ) -> Result<()> {
     let (head, mut body) = request.into_parts();
     let path = head.uri.path_and_query()
-        .map(|pq| pq.as_str().to_string())
-        .unwrap_or_default();
-    let method = head.method.as_str().to_string();
+        .map(|pq| pq.as_str())
+        .unwrap_or("");
+    let method = head.method.as_str();
     // Log all request headers to see CF/cloudflared additions
     let mut header_summary = String::new();
     for (k, v) in head.headers.iter() {
         if let Ok(val) = v.to_str() {
-            header_summary.push_str(&format!(" {}={}", k, val));
+            header_summary.push(' ');
+            header_summary.push_str(k.as_str());
+            header_summary.push('=');
+            header_summary.push_str(val);
         }
     }
     info!(">>> {} {}{}", method, path, header_summary);
@@ -213,8 +216,7 @@ async fn handle_stream(
     if path.starts_with("/tunnel/connect") {
         let target = head.headers.get("x-target")
             .and_then(|v| v.to_str().ok())
-            .unwrap_or("")
-            .to_string();
+            .unwrap_or("");
         if target.is_empty() { return send_err(respond, 400, "no target").await; }
 
         // HMAC verification
@@ -316,10 +318,10 @@ async fn handle_stream(
         // Store session
         let sid = state.next_id.fetch_add(1, Ordering::Relaxed);
         let tgt = Arc::new(tokio::sync::Mutex::new(target_stream));
-        state.sessions.write().await.insert(sid, Session {
+        state.sessions.write().await.insert(sid, Arc::new(Session {
             target: tgt,
             last_active: AtomicU64::new(now_ms()),
-        });
+        }));
         // Return 200 + ServerHello + SID
         let resp = http::Response::builder()
             .status(200)
@@ -362,9 +364,10 @@ async fn handle_stream(
             }
         }
 
-        let session = { state.sessions.read().await.get(&sid).map(|s| s.target.clone()) };
+        let session = state.sessions.read().await.get(&sid).cloned();
         match session {
-            Some(tm) => {
+            Some(s) => {
+                let tm = s.target.clone();
                 let mut req_data = Vec::new();
                 while let Some(Ok(chunk)) = body.data().await {
                     req_data.extend_from_slice(&chunk);
@@ -391,10 +394,8 @@ async fn handle_stream(
                     _ => {}
                 }
                 drop(t);
-                // Update session last_active (read lock, atomic store)
-                if let Some(s) = state.sessions.read().await.get(&sid) {
-                    s.last_active.store(now_ms(), Ordering::Relaxed);
-                }
+                // Update session last_active via Arc (no second read lock)
+                s.last_active.store(now_ms(), Ordering::Relaxed);
                 info!("[/data] [sid={}] return {} bytes", sid, resp.len());
 
                 let resp_http = http::Response::builder()

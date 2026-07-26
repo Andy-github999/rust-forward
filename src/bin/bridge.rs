@@ -106,12 +106,14 @@ async fn handle(
     };
     tcp.write_all(&[0x05,0x00,0x00,0x01,0,0,0,0,0,0]).await?;
 
-    // Read ClientHello
-    let mut fd = Vec::new();
-    let mut tmp = [0u8; 4096];
+    // Read ClientHello directly into Vec (zero-copy from stack)
+    let mut fd = vec![0u8; 8192];
     tokio::select! {
-        r = tcp.read(&mut tmp) => { if let Ok(n) = r { if n > 0 { fd = tmp[..n].to_vec(); } } }
-        _ = tokio::time::sleep(Duration::from_millis(200)) => {}
+        r = tcp.read(&mut fd) => { match r {
+            Ok(n) if n > 0 => fd.truncate(n),
+            _ => fd.clear(),
+        }}
+        _ = tokio::time::sleep(Duration::from_millis(200)) => { fd.clear(); }
     }
     info!("[{}] ClientHello {} bytes", target, fd.len());
 
@@ -158,9 +160,10 @@ async fn handle(
     let (mut tr, mut tw) = tcp.into_split();
 
     // /data loop
-    let mut data = vec![0u8; 65536];
-    let mut more = vec![0u8; 8192];
+    let mut data = Vec::with_capacity(65536 + 8192);
+    let mut more = [0u8; 8192];
     loop {
+        data.resize(65536, 0);
         let n = match tr.read(&mut data).await { Ok(0) => break, Ok(n) => n, Err(_) => break };
         data.truncate(n);
         loop { match tr.try_read(&mut more) { Ok(0)|Err(_) => break, Ok(n) => data.extend_from_slice(&more[..n]), } }
@@ -176,7 +179,7 @@ async fn handle(
             .body(()).unwrap();
         match h2c.send_request(req, false) {
             Ok((rf, mut st)) => {
-                st.send_data(Bytes::copy_from_slice(&data), true)?;
+                st.send_data(Bytes::from(std::mem::take(&mut data)), true)?;
                 match rf.await {
                     Ok(r) => {
                         let (_, mut bd) = r.into_parts();
