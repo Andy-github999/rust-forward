@@ -23,6 +23,35 @@ struct Session {
     last_active: AtomicU64,
 }
 
+struct DnsCache {
+    cache: HashMap<String, SocketAddr>,
+}
+
+impl DnsCache {
+    async fn resolve(&mut self, target: &str) -> Result<SocketAddr> {
+        let (host, port) = if let Ok(addr) = target.parse::<SocketAddr>() {
+            return Ok(addr);
+        } else {
+            let (h, p) = target.rsplit_once(':').ok_or_else(|| anyhow::anyhow!("invalid target: {}", target))?;
+            (h.to_string(), p.parse::<u16>()?)
+        };
+        if let Some(addr) = self.cache.get(&host) {
+            return Ok(*addr);
+        }
+        let addrs = tokio::net::lookup_host((host.as_str(), port)).await?;
+        let v4 = addrs.filter(|a| a.is_ipv4()).next()
+            .ok_or_else(|| anyhow::anyhow!("no IPv4 for {}", target))?;
+        self.cache.insert(host, v4);
+        Ok(v4)
+    }
+
+    fn clear_host(&mut self, target: &str) {
+        if let Some((h, _)) = target.rsplit_once(':') {
+            self.cache.remove(h);
+        }
+    }
+}
+
 struct AppState {
     password: String,
     connect_timeout: u64,
@@ -31,6 +60,7 @@ struct AppState {
     sessions: RwLock<HashMap<SessionId, Session>>,
     next_id: AtomicU64,
     nonces: Mutex<Vec<([u8; 16], Instant)>>,
+    dns_cache: tokio::sync::Mutex<DnsCache>,
 }
 
 fn get_query_param(query: &str, key: &str) -> Option<String> {
@@ -57,6 +87,7 @@ struct Args {
     #[arg(long, default_value = "300")]
     idle_timeout: u64,
 }
+
 #[tokio::main]
 async fn main() -> Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -100,8 +131,8 @@ async fn main() -> Result<()> {
         sessions: RwLock::new(HashMap::new()),
         next_id: AtomicU64::new(1),
         nonces: Mutex::new(Vec::new()),
+        dns_cache: tokio::sync::Mutex::new(DnsCache { cache: HashMap::new() }),
     });
-
     // Session idle cleanup
     {
         let st = state.clone();
@@ -144,6 +175,8 @@ async fn serve_h2(
     state: Arc<AppState>,
 ) -> Result<()> {
     let mut h2 = h2::server::Builder::new()
+        .max_concurrent_streams(256)
+        .initial_connection_window_size(16 * 1024 * 1024)
         .handshake(tls_stream)
         .await?;
     info!("H2 connection established");
@@ -170,7 +203,14 @@ async fn handle_stream(
         .map(|pq| pq.as_str().to_string())
         .unwrap_or_default();
     let method = head.method.as_str().to_string();
-    info!(">>> {} {}", method, path);
+    // Log all request headers to see CF/cloudflared additions
+    let mut header_summary = String::new();
+    for (k, v) in head.headers.iter() {
+        if let Ok(val) = v.to_str() {
+            header_summary.push_str(&format!(" {}={}", k, val));
+        }
+    }
+    info!(">>> {} {}{}", method, path, header_summary);
 
     // ===== POST /connect =====
     if path.starts_with("/connect") {
@@ -210,16 +250,32 @@ async fn handle_stream(
             helo.extend_from_slice(&chunk);
             let _ = body.flow_control().release_capacity(chunk.len());
         }
-        info!("[/connect] ClientHello {} bytes", helo.len());
+        info!("[/connect] [{}] ClientHello {} bytes", target, helo.len());
 
-        // Connect to target
+        // Resolve target via DNS cache, then TCP connect
+        let resolved = {
+            let mut dns = state.dns_cache.lock().await;
+            dns.resolve(&target).await
+        };
+        let target_addr = match resolved {
+            Ok(addr) => addr,
+            Err(e) => { return send_err(respond, 502, &format!("dns: {}", e)).await; }
+        };
+        info!("[/connect] [{}] resolved to {}", target, target_addr);
+        let ip_target = format!("{}:{}", target_addr.ip(), target_addr.port());
         let mut target_stream = match tokio::time::timeout(
             Duration::from_secs(state.connect_timeout),
-            connect_tcp_v4(&target, state.connect_timeout),
+            connect_tcp_v4(&ip_target, state.connect_timeout),
         ).await {
             Ok(Ok(s)) => s,
-            Ok(Err(e)) => { return send_err(respond, 502, &format!("connect: {}", e)).await; }
-            Err(_) => { return send_err(respond, 504, "timeout").await; }
+            Ok(Err(e)) => {
+                state.dns_cache.lock().await.clear_host(&target);
+                return send_err(respond, 502, &format!("connect: {}", e)).await;
+            }
+            Err(_) => {
+                state.dns_cache.lock().await.clear_host(&target);
+                return send_err(respond, 504, "timeout").await;
+            }
         };
 
         // Write ClientHello
@@ -238,7 +294,7 @@ async fn handle_stream(
                 Ok(Ok(n)) => resp_data.extend_from_slice(&tbuf[..n]),
             }
         }
-        info!("read {} bytes from target", resp_data.len());
+        info!("[/connect] [{}] read {} bytes from target", target, resp_data.len());
         if resp_data.is_empty() { return send_err(respond, 504, "no response").await; }
 
         // Check session limit
@@ -265,7 +321,7 @@ async fn handle_stream(
             .unwrap();
         let mut send_stream = respond.send_response(resp, false)?;
         send_stream.send_data(Bytes::from(resp_data), true)?;
-        info!("[/connect] done (session {})", sid);
+        info!("[/connect] [{}] done (session {})", target, sid);
         return Ok(());
     }
     // ===== POST /data =====
@@ -274,7 +330,6 @@ async fn handle_stream(
             .and_then(|q| get_query_param(q, "id"))
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
-        info!("[/data] sid={}", sid);
 
         // HMAC verification
         if !state.password.is_empty() {
@@ -308,16 +363,15 @@ async fn handle_stream(
                     req_data.extend_from_slice(&chunk);
                     let _ = body.flow_control().release_capacity(chunk.len());
                 }
-                info!("[/data] read {} bytes", req_data.len());
 
                 let mut t = tm.lock().await;
                 if !req_data.is_empty() { t.write_all(&req_data).await?; }
 
                 let mut buf = [0u8; 65536];
                 let mut resp = Vec::new();
-                match tokio::time::timeout(Duration::from_millis(500), t.read(&mut buf)).await {
-                    Ok(Ok(0)) => info!("[/data] target EOF"),
-                    Err(_) => info!("[/data] target timeout"),
+                match tokio::time::timeout(Duration::from_secs(5), t.read(&mut buf)).await {
+                    Ok(Ok(0)) => info!("[/data] [sid={}] target EOF", sid),
+                    Err(_) => info!("[/data] [sid={}] target timeout", sid),
                     Ok(Ok(n)) => {
                         resp.extend_from_slice(&buf[..n]);
                         for _ in 0..20 {
@@ -334,7 +388,7 @@ async fn handle_stream(
                 if let Some(s) = state.sessions.read().await.get(&sid) {
                     s.last_active.store(now_ms(), Ordering::Relaxed);
                 }
-                info!("[/data] return {} bytes", resp.len());
+                info!("[/data] [sid={}] return {} bytes", sid, resp.len());
 
                 let resp_http = http::Response::builder()
                     .status(200)
@@ -345,7 +399,7 @@ async fn handle_stream(
                 send_stream.send_data(Bytes::from(resp), true)?;
             }
             None => {
-                warn!("[/data] session {} not found", sid);
+                warn!("[/data] [sid={}] session not found", sid);
                 return send_err(respond, 404, "session not found").await;
             }
         }

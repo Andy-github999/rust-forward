@@ -16,8 +16,7 @@ pub async fn connect_tcp_v4(target: &str, timeout_secs: u64) -> Result<tokio::ne
         tokio::net::TcpStream::connect(v4),
     ).await??;
 
-
-    // TCP keepalive via socket2 (15s interval) - prevents Cloudflare idle timeout
+    // TCP keepalive via socket2 (15s interval)
     let stream = match stream.into_std() {
         Ok(std) => {
             use socket2::{SockRef, TcpKeepalive};

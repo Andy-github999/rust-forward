@@ -25,6 +25,8 @@ struct Args {
     insecure: bool,
     #[arg(long, default_value = "65536")]
     buf_size: usize,
+    #[arg(long)]
+    cf_ip: Option<String>,
 }
 
 fn resolve_connect(cli: Option<&str>) -> String {
@@ -38,10 +40,15 @@ async fn main() {
     let args = Args::parse();
     let password = resolve_password(args.password.as_deref());
     let connect_str = resolve_connect(args.connect.as_deref());
-    if connect_str.is_empty() { error!("--connect required"); std::process::exit(1); }
-    let _ = rustls::crypto::ring::default_provider().install_default();
     let (ch, cp) = connect_str.rsplit_once(':').unwrap_or((&connect_str, "443"));
-    let ca = format!("{}:{}", ch, cp.parse::<u16>().expect("port"));
+    let port = cp.parse::<u16>().expect("port");
+    let ca = if let Some(ip) = &args.cf_ip {
+        let addr = format!("{}:{}", ip, port);
+        info!("using CF preferred IP: {} (original host: {})", addr, ch);
+        addr
+    } else {
+        format!("{}:{}", ch, port)
+    };
     let shared: SharedH2Client = Arc::new(RwLock::new(None));
     let s1 = shared.clone();
     let s2 = args.server_name.clone();
@@ -207,7 +214,10 @@ async fn connect_h2(addr: &str, server_name: &str, insecure: bool) -> Result<h2:
     let sn = ServerName::try_from(cn.clone())
         .map_err(|e| anyhow::anyhow!("server name: {:?}", e))?;
     let tls = TlsConnector::from(cfg).connect(sn, tcp).await?;
-    let (h2, conn) = h2::client::Builder::new().handshake(tls).await?;
+    let (h2, conn) = h2::client::Builder::new()
+        .max_concurrent_streams(256)
+        .initial_connection_window_size(16 * 1024 * 1024)
+        .handshake(tls).await?;
     tokio::spawn(async move { let _ = conn.await; });
     info!("H2 connected to {}", addr);
     Ok(h2)
