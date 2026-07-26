@@ -63,16 +63,6 @@ struct AppState {
     dns_cache: tokio::sync::Mutex<DnsCache>,
 }
 
-fn get_query_param(query: &str, key: &str) -> Option<String> {
-    for pair in query.split('&') {
-        let mut kv = pair.splitn(2, '=');
-        if kv.next()? == key {
-            return kv.next().map(|v| v.to_string());
-        }
-    }
-    None
-}
-
 #[derive(Parser, Debug)]
 #[command(name = "forward", about = "H2 TCP forward for OpenWrt")]
 struct Args {
@@ -213,11 +203,12 @@ async fn handle_stream(
     }
     info!(">>> {} {}{}", method, path, header_summary);
 
-    // ===== POST /connect =====
-    if path.starts_with("/connect") {
-        let target = head.uri.query()
-            .and_then(|q| get_query_param(q, "target"))
-            .unwrap_or_default();
+    // ===== POST /tunnel/connect =====
+    if path.starts_with("/tunnel/connect") {
+        let target = head.headers.get("x-target")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("")
+            .to_string();
         if target.is_empty() { return send_err(respond, 400, "no target").await; }
 
         // HMAC verification
@@ -225,7 +216,7 @@ async fn handle_stream(
             let time = head.headers.get("x-time").and_then(|v| v.to_str().ok()).unwrap_or("");
             let nonce_h = head.headers.get("x-nonce").and_then(|v| v.to_str().ok()).unwrap_or("");
             let sign = head.headers.get("x-sign").and_then(|v| v.to_str().ok()).unwrap_or("");
-            if !hmac_verify(state.password.as_bytes(), time, nonce_h, sign, "/connect", "") {
+            if !hmac_verify(state.password.as_bytes(), time, nonce_h, sign, "/tunnel/connect", "") {
                 return send_err(respond, 502, "bad auth").await;
             }
             // Replay protection
@@ -325,10 +316,10 @@ async fn handle_stream(
         info!("[/connect] [{}] done (session {})", target, sid);
         return Ok(());
     }
-    // ===== POST /data =====
-    if path.starts_with("/data") {
-        let sid: u64 = head.uri.query()
-            .and_then(|q| get_query_param(q, "id"))
+    // ===== POST /tunnel/data =====
+    if path.starts_with("/tunnel/data") {
+        let sid: u64 = head.headers.get("x-session-id")
+            .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
 
@@ -338,7 +329,7 @@ async fn handle_stream(
             let nonce_h = head.headers.get("x-nonce").and_then(|v| v.to_str().ok()).unwrap_or("");
             let sign = head.headers.get("x-sign").and_then(|v| v.to_str().ok()).unwrap_or("");
             let sid_str = sid.to_string();
-            if !hmac_verify(state.password.as_bytes(), time, nonce_h, sign, "/data", &sid_str) {
+            if !hmac_verify(state.password.as_bytes(), time, nonce_h, sign, "/tunnel/data", &sid_str) {
                 return send_err(respond, 502, "bad auth").await;
             }
             // Replay protection (same as /connect)
