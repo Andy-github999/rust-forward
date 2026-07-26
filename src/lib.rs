@@ -1,6 +1,7 @@
 use anyhow::Result;
 use std::net::SocketAddr;
 use std::time::Duration;
+use tokio::io::AsyncReadExt;
 use tokio::net::TcpStream;
 
 pub async fn connect_tcp_v4(target: &str, timeout_secs: u64) -> Result<TcpStream> {
@@ -56,6 +57,35 @@ pub async fn connect_via_socks5(
         }
         Err(e) => Err(anyhow::anyhow!("into_std: {}", e)),
     }
+}
+
+/// Read from a TCP stream with idle timeout batching.
+/// - Waits up to `first_timeout` for the first byte.
+/// - After receiving data, waits up to `idle_timeout` between chunks.
+/// - Returns all data received (may be empty, never an error).
+pub async fn read_until_idle(
+    stream: &mut TcpStream,
+    first_timeout: Duration,
+    idle_timeout: Duration,
+) -> Vec<u8> {
+    let mut buf = vec![0u8; 65536];
+    let mut total = 0usize;
+    let mut timeout = first_timeout;
+    loop {
+        if total >= buf.len() {
+            buf.resize(buf.len() + 32768, 0);
+        }
+        match tokio::time::timeout(timeout, stream.read(&mut buf[total..])).await {
+            Ok(Ok(0)) | Ok(Err(_)) => break,
+            Ok(Ok(n)) => {
+                total += n;
+                timeout = idle_timeout;
+            }
+            _ => break,
+        }
+    }
+    buf.truncate(total);
+    buf
 }
 
 #[derive(Debug)]

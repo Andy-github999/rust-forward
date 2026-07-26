@@ -6,7 +6,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
 use rust_forward::*;
 use bytes::Bytes;
@@ -24,32 +24,76 @@ struct Session {
     last_active: AtomicU64,
 }
 
+const DNS_TTL: Duration = Duration::from_secs(300);
+
+struct DnsEntry {
+    addr: SocketAddr,
+    inserted: Instant,
+}
+
 /// Look up a host:port in the DashMap DNS cache; insert on miss.
-async fn resolve_dns(cache: &DashMap<String, SocketAddr>, target: &str) -> Result<SocketAddr> {
+async fn resolve_dns(cache: &DashMap<String, DnsEntry>, target: &str) -> Result<SocketAddr> {
     let (host, port) = if let Ok(addr) = target.parse::<SocketAddr>() {
         return Ok(addr);
     } else {
         let (h, p) = target.rsplit_once(':').ok_or_else(|| anyhow::anyhow!("invalid target: {}", target))?;
         (h.to_string(), p.parse::<u16>()?)
     };
-    if let Some(addr) = cache.get(&host) {
-        return Ok(*addr);
+    if let Some(entry) = cache.get(&host) {
+        if entry.inserted.elapsed() < DNS_TTL {
+            return Ok(entry.addr);
+        }
+        // Expired — fall through to re-resolve
+        drop(entry);
+        cache.remove(&host);
     }
     let addrs = tokio::net::lookup_host((host.as_str(), port)).await?;
     let v4 = addrs.filter(|a| a.is_ipv4()).next()
         .ok_or_else(|| anyhow::anyhow!("no IPv4 for {}", target))?;
-    cache.insert(host, v4);
+    cache.insert(host, DnsEntry { addr: v4, inserted: Instant::now() });
     Ok(v4)
 }
 
 /// Remove a host from the DNS cache on connection failure.
-fn dns_remove(cache: &DashMap<String, SocketAddr>, target: &str) {
+fn dns_remove(cache: &DashMap<String, DnsEntry>, target: &str) {
     if let Some((h, _)) = target.rsplit_once(':') {
         cache.remove(h);
     }
 }
 
-
+/// Verify HMAC headers + replay protection for a request, in a single call.
+/// Returns Ok(()) if valid, or Err((status_code, message)) for the response.
+fn verify_hmac_request(
+    conn: &ConnState,
+    password: &str,
+    headers: &http::HeaderMap,
+    path: &str,
+    session_id: &str,
+) -> std::result::Result<(), (u16, &'static str)> {
+    if password.is_empty() {
+        return Ok(());
+    }
+    let time = headers.get("x-time").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let nonce_h = headers.get("x-nonce").and_then(|v| v.to_str().ok()).unwrap_or("");
+    let sign = headers.get("x-sign").and_then(|v| v.to_str().ok()).unwrap_or("");
+    if !hmac_verify(password.as_bytes(), time, nonce_h, sign, path, session_id) {
+        return Err((502, "bad auth"));
+    }
+    // Replay protection via nonce dedup
+    if let Some(nonce_bytes) = hex::decode(nonce_h).ok().filter(|v| v.len() == 16) {
+        let mut arr = [0u8; 16];
+        arr.copy_from_slice(&nonce_bytes);
+        let mut nonces = conn.nonces.lock().unwrap();
+        if nonces.len() > conn.max_nonces {
+            nonces.retain(|(_, t)| t.elapsed() < Duration::from_secs(30));
+        }
+        if nonces.iter().any(|(n, _)| *n == arr) {
+            return Err((502, "replay"));
+        }
+        nonces.push((arr, Instant::now()));
+    }
+    Ok(())
+}
 
 struct AppState {
     password: String,
@@ -64,7 +108,8 @@ struct ConnState {
     sessions: DashMap<SessionId, Arc<Session>>,
     next_id: AtomicU64,
     nonces: StdMutex<Vec<([u8; 16], Instant)>>,
-    dns_cache: DashMap<String, SocketAddr>,
+    max_nonces: usize,
+    dns_cache: DashMap<String, DnsEntry>,
 }
 
 #[derive(Parser, Debug)]
@@ -165,6 +210,7 @@ async fn serve_h2(
         sessions: DashMap::new(),
         next_id: AtomicU64::new(1),
         nonces: StdMutex::new(Vec::new()),
+        max_nonces: 10_000,
         dns_cache: DashMap::new(),
     });
 
@@ -228,36 +274,9 @@ async fn handle_stream(
             .unwrap_or("");
         if target.is_empty() { return send_err(respond, 400, "no target").await; }
 
-        // HMAC verification
-        if !state.password.is_empty() {
-            let time = head.headers.get("x-time").and_then(|v| v.to_str().ok()).unwrap_or("");
-            let nonce_h = head.headers.get("x-nonce").and_then(|v| v.to_str().ok()).unwrap_or("");
-            let sign = head.headers.get("x-sign").and_then(|v| v.to_str().ok()).unwrap_or("");
-            if !hmac_verify(state.password.as_bytes(), time, nonce_h, sign, "/tunnel/connect", "") {
-                return send_err(respond, 502, "bad auth").await;
-            }
-            // Replay protection
-            if let Some(nonce_bytes) = hex::decode(nonce_h).ok().filter(|v| v.len() == 16) {
-                let mut arr = [0u8; 16];
-                arr.copy_from_slice(&nonce_bytes);
-                let is_replay = {
-                    let mut nonces = conn.nonces.lock().unwrap();
-                    // lazy cleanup: remove expired entries
-                    if nonces.len() > 10_000 {
-                        nonces.retain(|(_, t)| t.elapsed() < std::time::Duration::from_secs(30));
-                    }
-                    // check for duplicate
-                    if nonces.iter().any(|(n, _)| *n == arr) {
-                        true
-                    } else {
-                        nonces.push((arr, Instant::now()));
-                        false
-                    }
-                }; // StdMutexGuard dropped here
-                if is_replay {
-                    return send_err(respond, 502, "replay").await;
-                }
-            }
+        // HMAC verification + replay protection (single helper call)
+        if let Err((code, msg)) = verify_hmac_request(conn, &state.password, &head.headers, "/tunnel/connect", "") {
+            return send_err(respond, code, msg).await;
         }
 
         // Read ClientHello from body (loop over all H2 DATA frames)
@@ -302,19 +321,12 @@ async fn handle_stream(
         // Write ClientHello
         if !helo.is_empty() { target_stream.write_all(&helo).await?; }
 
-        // Read ServerHello from target
-        let mut tbuf = [0u8; 65536];
-        let mut resp_data = Vec::new();
-        match tokio::time::timeout(Duration::from_secs(10), target_stream.read(&mut tbuf)).await {
-            Ok(Ok(0)) | Ok(Err(_)) | Err(_) => {}
-            Ok(Ok(n)) => resp_data.extend_from_slice(&tbuf[..n]),
-        }
-        for _ in 0..20 {
-            match tokio::time::timeout(Duration::from_millis(200), target_stream.read(&mut tbuf)).await {
-                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
-                Ok(Ok(n)) => resp_data.extend_from_slice(&tbuf[..n]),
-            }
-        }
+        // Read ServerHello from target (idle-batched: 10s first byte, 200ms idle between chunks)
+        let resp_data = read_until_idle(
+            &mut target_stream,
+            Duration::from_secs(10),
+            Duration::from_millis(200),
+        ).await;
         info!("[/connect] [{}] read {} bytes from target", target, resp_data.len());
         if resp_data.is_empty() { return send_err(respond, 504, "no response").await; }
 
@@ -349,35 +361,10 @@ async fn handle_stream(
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
 
-        // HMAC verification
-        if !state.password.is_empty() {
-            let time = head.headers.get("x-time").and_then(|v| v.to_str().ok()).unwrap_or("");
-            let nonce_h = head.headers.get("x-nonce").and_then(|v| v.to_str().ok()).unwrap_or("");
-            let sign = head.headers.get("x-sign").and_then(|v| v.to_str().ok()).unwrap_or("");
-            let sid_str = sid.to_string();
-            if !hmac_verify(state.password.as_bytes(), time, nonce_h, sign, "/tunnel/data", &sid_str) {
-                return send_err(respond, 502, "bad auth").await;
-            }
-            // Replay protection (same as /connect)
-            if let Some(nonce_bytes) = hex::decode(nonce_h).ok().filter(|v| v.len() == 16) {
-                let mut arr = [0u8; 16];
-                arr.copy_from_slice(&nonce_bytes);
-                let is_replay = {
-                    let mut nonces = conn.nonces.lock().unwrap();
-                    if nonces.len() > 10_000 {
-                        nonces.retain(|(_, t)| t.elapsed() < std::time::Duration::from_secs(30));
-                    }
-                    if nonces.iter().any(|(n, _)| *n == arr) {
-                        true
-                    } else {
-                        nonces.push((arr, Instant::now()));
-                        false
-                    }
-                }; // StdMutexGuard dropped here
-                if is_replay {
-                    return send_err(respond, 502, "replay").await;
-                }
-            }
+        // HMAC verification + replay protection (single helper call)
+        let sid_str = sid.to_string();
+        if let Err((code, msg)) = verify_hmac_request(conn, &state.password, &head.headers, "/tunnel/data", &sid_str) {
+            return send_err(respond, code, msg).await;
         }
 
         let session = conn.sessions.get(&sid).map(|r| r.clone());
@@ -393,21 +380,14 @@ async fn handle_stream(
                 let mut t = tm.lock().await;
                 if !req_data.is_empty() { t.write_all(&req_data).await?; }
 
-                let mut buf = [0u8; 65536];
-                let mut resp = Vec::new();
-                match tokio::time::timeout(Duration::from_secs(5), t.read(&mut buf)).await {
-                    Ok(Ok(0)) => info!("[/data] [sid={}] target EOF", sid),
-                    Err(_) => info!("[/data] [sid={}] target timeout", sid),
-                    Ok(Ok(n)) => {
-                        resp.extend_from_slice(&buf[..n]);
-                        for _ in 0..20 {
-                            match tokio::time::timeout(Duration::from_millis(100), t.read(&mut buf)).await {
-                                Ok(Ok(0)) | Ok(Err(_)) | Err(_) => break,
-                                Ok(Ok(n)) => resp.extend_from_slice(&buf[..n]),
-                            }
-                        }
-                    }
-                    _ => {}
+                // Read target response (idle-batched: 5s first byte, 100ms idle between chunks)
+                let resp = read_until_idle(
+                    &mut t,
+                    Duration::from_secs(5),
+                    Duration::from_millis(100),
+                ).await;
+                if resp.is_empty() {
+                    info!("[/data] [sid={}] target no response", sid);
                 }
                 drop(t);
                 // Update session last_active via Arc (no second read lock)
