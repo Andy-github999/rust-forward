@@ -157,12 +157,13 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    let default_level = if cfg!(debug_assertions) { "info" } else { "error" };
     tracing_subscriber::fmt()
         .with_ansi(false)
         .with_target(false)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level))
         )
         .init();
     let args = Args::parse();
