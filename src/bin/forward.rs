@@ -4,11 +4,12 @@ use std::fs;
 use tracing::{error, info, warn};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::Mutex;
+use tokio::sync::Notify;
 use rust_forward::*;
 use bytes::Bytes;
 use dashmap::DashMap;
@@ -26,6 +27,18 @@ struct Session {
 }
 
 const DNS_TTL: Duration = Duration::from_secs(300);
+
+/// Maximum concurrent TCP connections (AtomicUsize guard, no kernel wait).
+const MAX_CONN: usize = 64;
+
+/// Drop guard that decrements the connection counter.
+struct ConnGuard(Arc<AtomicUsize>);
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 struct DnsEntry {
     addr: SocketAddr,
@@ -211,12 +224,23 @@ async fn main() -> Result<()> {
         dns_cache: DashMap::new(),
     });
 
+    let conn_limit = Arc::new(AtomicUsize::new(0));
+
     loop {
         match lis.accept().await {
             Ok((tcp, peer)) => {
+                let prev = conn_limit.fetch_add(1, Ordering::AcqRel);
+                if prev >= MAX_CONN {
+                    conn_limit.fetch_sub(1, Ordering::AcqRel);
+                    warn!("[{}] connection limit reached ({}), dropping", peer, MAX_CONN);
+                    drop(tcp);
+                    continue;
+                }
+                let guard = ConnGuard(conn_limit.clone());
                 let tls = tls_acceptor.clone();
                 let st = state.clone();
                 tokio::spawn(async move {
+                    let _guard = guard;
                     let tls_stream = match tls.accept(tcp).await {
                         Ok(s) => s,
                         Err(e) => { warn!("[{}] TLS: {}", peer, e); return; }
@@ -268,29 +292,49 @@ async fn serve_h2(
         });
     }
 
-    // H2 keepalive: send PING every 20s to prevent Cloudflare Edge from timing out
+    // H2 keepalive: send PING every 20s to prevent Cloudflare Edge from timing out.
+    // If PING fails, signal shutdown so the accept loop exits and frees the fd.
     let ping_handle = h2.ping_pong();
+    let shutdown = Arc::new(Notify::new());
     if let Some(mut ping_pong) = ping_handle {
+        let sig = shutdown.clone();
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(20)).await;
                 if ping_pong.ping(h2::Ping::opaque()).await.is_err() {
                     info!("H2 keepalive PING failed, connection may be dead");
+                    sig.notify_one();
                     break;
                 }
             }
         });
     }
 
-    while let Some(result) = h2.accept().await {
-        let (req, respond) = result?;
-        let st = state.clone();
-        let cn = conn.clone();
-        tokio::spawn(async move {
-            if let Err(e) = handle_stream(req, respond, &st, &cn).await {
-                warn!("stream: {}", e);
+    loop {
+        tokio::select! {
+            result = h2.accept() => {
+                match result {
+                    Some(Ok((req, respond))) => {
+                        let st = state.clone();
+                        let cn = conn.clone();
+                        tokio::spawn(async move {
+                            if let Err(e) = handle_stream(req, respond, &st, &cn).await {
+                                warn!("stream: {}", e);
+                            }
+                        });
+                    }
+                    Some(Err(e)) => {
+                        warn!("H2 accept error: {}", e);
+                        break;
+                    }
+                    None => break,
+                }
             }
-        });
+            _ = shutdown.notified() => {
+                info!("H2 connection shutdown by keepalive failure, releasing fd");
+                break;
+            }
+        }
     }
     Ok(())
 }
