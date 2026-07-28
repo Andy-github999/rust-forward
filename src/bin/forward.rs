@@ -148,7 +148,7 @@ struct Args {
     connect_timeout: u64,
     #[arg(long, default_value = "1024")]
     max_sessions: usize,
-    #[arg(long, default_value = "300")]
+    #[arg(long, default_value = "60")]
     idle_timeout: u64,
     /// SOCKS5 proxy address (e.g., 192.168.2.1:1070). Empty = direct connect.
     #[arg(long, default_value = "")]
@@ -157,7 +157,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let default_level = if cfg!(debug_assertions) { "info" } else { "error" };
+    let default_level = if cfg!(feature = "logging") { "info" } else { "error" };
     tracing_subscriber::fmt()
         .with_ansi(false)
         .with_target(false)
@@ -225,6 +225,23 @@ async fn main() -> Result<()> {
         dns_cache: DashMap::new(),
     });
 
+    // Global session idle cleanup (one task for entire process)
+    {
+        let state_clone = state.clone();
+        let idle_timeout = state.idle_timeout;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(idle_timeout / 2).await;
+                let before = state_clone.sessions.len();
+                let deadline = now_ms() - idle_timeout.as_millis() as u64;
+                state_clone.sessions.retain(|_, s| s.last_active.load(Ordering::Relaxed) >= deadline);
+                if state_clone.sessions.len() != before {
+                    info!("session cleanup: {} -> {}", before, state_clone.sessions.len());
+                }
+            }
+        });
+    }
+
     let conn_limit = Arc::new(AtomicUsize::new(0));
 
     loop {
@@ -276,23 +293,6 @@ async fn serve_h2(
         max_nonces: 10_000,
     });
 
-    // Global session idle cleanup
-    {
-        let sessions = state.sessions.clone();
-        let idle_timeout = state.idle_timeout;
-        tokio::spawn(async move {
-            loop {
-                tokio::time::sleep(idle_timeout / 2).await;
-                let before = sessions.len();
-                let deadline = now_ms() - idle_timeout.as_millis() as u64;
-                sessions.retain(|_, s| s.last_active.load(Ordering::Relaxed) >= deadline);
-                if sessions.len() != before {
-                    info!("session cleanup: {} -> {}", before, sessions.len());
-                }
-            }
-        });
-    }
-
     // H2 keepalive: send PING every 20s to prevent Cloudflare Edge from timing out.
     // If PING fails, signal shutdown so the accept loop exits and frees the fd.
     let ping_handle = h2.ping_pong();
@@ -302,10 +302,13 @@ async fn serve_h2(
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(20)).await;
-                if ping_pong.ping(h2::Ping::opaque()).await.is_err() {
-                    info!("H2 keepalive PING failed, connection may be dead");
-                    sig.notify_one();
-                    break;
+                match tokio::time::timeout(Duration::from_secs(10), ping_pong.ping(h2::Ping::opaque())).await {
+                    Ok(Ok(_)) => {}
+                    _ => {
+                        info!("H2 keepalive PING failed or timed out, connection may be dead");
+                        sig.notify_one();
+                        break;
+                    }
                 }
             }
         });
@@ -505,6 +508,32 @@ async fn handle_stream(
                 return send_err(respond, 410, "session gone").await;
             }
         }
+        return Ok(());
+    }
+    // ===== POST /tunnel/close =====
+    if path.starts_with("/tunnel/close") {
+        let sid: u64 = head.headers.get("x-session-id")
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+
+        let sid_str = sid.to_string();
+        if let Err(e) = verify_hmac_request(conn, &state.password, &head.headers, "/tunnel/close", &sid_str) {
+            let msg = match e { AuthError::BadAuth => "bad auth", AuthError::Replay => "replay" };
+            return send_err(respond, 502, msg).await;
+        }
+
+        if state.sessions.remove(&sid).is_some() {
+            info!("[/close] session {} closed, target fd released", sid);
+        } else {
+            warn!("[/close] session {} not found", sid);
+        }
+        let resp = http::Response::builder()
+            .status(200)
+            .body(())
+            .unwrap();
+        let mut send_stream = respond.send_response(resp, false)?;
+        send_stream.send_data(Bytes::from("ok"), true)?;
         return Ok(());
     }
 

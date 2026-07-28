@@ -106,6 +106,9 @@ async fn main() {
                             Err(e) => warn!("H2 PING failed: {}", e),
                         }
                     }
+                    _ = tokio::time::sleep(Duration::from_secs(10)) => {
+                        warn!("H2 PING timed out");
+                    }
                 }
             }
             // Reconnect (connection dropped OR health check failed)
@@ -366,6 +369,26 @@ async fn handle(
     }
     let elapsed = start.elapsed();
     info!("[{}] DONE: {:.1}s", target, elapsed.as_secs_f64());
+
+    // Cleanly close session on forward side to release target fd immediately
+    let close_h2c = rx.borrow_and_update().clone();
+    if let Some(mut h2c_close) = close_h2c {
+        let (time_c, nonce_c, sign_c) = hmac_sign(password.as_bytes(), "/tunnel/close", &sid);
+        let close_req = http::Request::builder().method("POST")
+            .uri(format!("https://{}/tunnel/close", server_name))
+            .header("x-session-id", &sid)
+            .header("x-time", &time_c)
+            .header("x-nonce", &nonce_c)
+            .header("x-sign", &sign_c)
+            .body(()).unwrap();
+        if let Ok((close_resp_fut, _send)) = h2c_close.send_request(close_req, true) {
+            match tokio::time::timeout(Duration::from_secs(10), close_resp_fut).await {
+                Ok(Ok(r)) => info!("[{}] session {} closed (status {})", target, sid, r.status()),
+                _ => warn!("[{}] session {} close ack lost (harmless)", target, sid),
+            }
+        }
+    }
+
     Ok(())
 }
 type H2Conn = h2::client::Connection<tokio_rustls::client::TlsStream<tokio::net::TcpStream>, Bytes>;
