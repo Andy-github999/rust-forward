@@ -1,7 +1,7 @@
 use clap::Parser;
 use futures_util::stream::StreamExt;
 use futures_util::SinkExt;
-use log::{error, info, warn};
+use log::{error, info};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::Arc;
@@ -101,6 +101,8 @@ async fn main() {
                                             if let Some(state) = stm.remove(&sid) {
                                                 let _ = state.ready.send(Err(anyhow::anyhow!(t)));
                                             }
+                                        } else if parts[0] == "CLOSE" {
+                                            st.lock().await.remove(&sid);
                                         }
                                     }
                                 }
@@ -108,23 +110,17 @@ async fn main() {
                                     if data.len() < 2 { continue; }
                                     let sid = u16::from_be_bytes([data[0], data[1]]);
                                     let payload = data[2..].to_vec();
-                                    let overflow = {
-                                        let mut stm = st.lock().await;
-                                        if let Some(state) = stm.get(&sid) {
-                                            if state.data_tx.try_send(payload).is_err() {
-                                                warn!("sid={} buffer full, dropping stream", sid);
-                                                stm.remove(&sid);
-                                                true
-                                            } else {
-                                                false
-                                            }
-                                        } else {
-                                            false
+
+                                    // 取出 Sender（快速，不阻塞其他 stream 的消息处理）
+                                    let data_tx = st.lock().await.get(&sid).map(|s| s.data_tx.clone());
+
+                                    if let Some(tx) = data_tx {
+                                        // 带 backpressure 的发送——慢 TCP 不会丢 stream
+                                        if tx.send(payload).await.is_err() {
+                                            st.lock().await.remove(&sid);
+                                            let mut w = writer.lock().await;
+                                            let _ = w.send(Message::Text(format!("CLOSE {}", sid).into())).await;
                                         }
-                                    };
-                                    if overflow {
-                                        let mut w = writer.lock().await;
-                                        let _ = w.send(Message::Text(format!("CLOSE {}", sid).into())).await;
                                     }
                                 }
                                 Ok(Message::Close(_)) => {

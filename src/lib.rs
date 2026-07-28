@@ -25,6 +25,9 @@ pub struct StreamState {
     pub data_tx: tokio::sync::mpsc::Sender<Vec<u8>>,
 }
 
+/// mpsc channel 容量：2048，约 128MB buffer（@ 64KB/帧），足够吸收突发
+const CHANNEL_CAP: usize = 2048;
+
 pub fn resolve_password(cli: Option<&str>) -> String {
     if let Some(p) = cli {
         return p.to_string();
@@ -126,7 +129,6 @@ pub async fn handle_socks5(
     };
 
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel::<Result<()>>();
-    const CHANNEL_CAP: usize = 256;
     let (data_tx, mut data_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(CHANNEL_CAP);
     streams.lock().await.insert(sid, StreamState { ready: ready_tx, data_tx });
 
