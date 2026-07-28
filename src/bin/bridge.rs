@@ -62,61 +62,26 @@ async fn main() {
     let s4 = ca.clone();
     // Initial connect — synchronously wait before accepting any SOCKS5 connection
     info!("Initial H2 connect to {}...", ca);
-    let (init_h2, mut init_conn) = loop {
+    let (init_h2, init_conn) = loop {
         match connect_h2(&ca, &s2, s3).await {
             Ok((h2, conn)) => { info!("Initial H2 connected"); break (h2, conn); }
             Err(e) => { error!("Initial H2 connect failed: {} (retry in 5s)", e); }
         }
         tokio::time::sleep(Duration::from_secs(5)).await;
     };
-    let init_ping_pong = init_conn.ping_pong().expect("ping_pong");
     tx.send(Some(init_h2)).ok();
-    // Background: poll connection health via H2 PING/PONG.
-    // Two-phase approach:
-    //   1. Wait 30s OR connection drop.
-    //   2. If 30s elapsed, send PING (connection stays polled). Healthy → continue; else reconnect.
+    // Background: wait for H2 connection to drop, then reconnect.
+    // No active PING (don't take PingPong — let connection auto-respond to
+    // forward's keepalive PINGs). Silent failures detected by /data retry timeouts.
     tokio::spawn(async move {
         let mut conn = init_conn;
-        let mut ping_pong = init_ping_pong;
         loop {
-            // Phase 1: wait 30s or connection drops
-            let should_check = {
-                tokio::select! {
-                    _ = &mut conn => {
-                        info!("H2 connection dropped, reconnecting...");
-                        false
-                    }
-                    _ = tokio::time::sleep(Duration::from_secs(30)) => {
-                        true
-                    }
-                }
-            };
-            if should_check {
-                // Phase 2: send PING while still polling connection
-                tokio::select! {
-                    _ = &mut conn => {
-                        info!("H2 connection dropped during PING");
-                    }
-                    result = ping_pong.ping(h2::Ping::opaque()) => {
-                        match result {
-                            Ok(_) => {
-                                info!("H2 health check OK");
-                                continue; // Healthy → skip reconnect
-                            }
-                            Err(e) => warn!("H2 PING failed: {}", e),
-                        }
-                    }
-                    _ = tokio::time::sleep(Duration::from_secs(10)) => {
-                        warn!("H2 PING timed out");
-                    }
-                }
-            }
-            // Reconnect (connection dropped OR health check failed)
+            let _ = (&mut conn).await;
+            info!("H2 connection dropped, reconnecting...");
             loop {
                 match connect_h2(&s4, &s2, s3).await {
-                    Ok((h2, mut new_conn)) => {
+                    Ok((h2, new_conn)) => {
                         tx_reconnect.send(Some(h2)).ok();
-                        ping_pong = new_conn.ping_pong().expect("ping_pong");
                         conn = new_conn;
                         break;
                     }

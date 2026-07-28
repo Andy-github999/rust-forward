@@ -294,7 +294,8 @@ async fn serve_h2(
     });
 
     // H2 keepalive: send PING every 20s to prevent Cloudflare Edge from timing out.
-    // If PING fails, signal shutdown so the accept loop exits and frees the fd.
+    // Bridge no longer takes PingPong, so its connection auto-responds with PONG.
+    // If PING fails (connection truly dead), signal shutdown to free the fd.
     let ping_handle = h2.ping_pong();
     let shutdown = Arc::new(Notify::new());
     if let Some(mut ping_pong) = ping_handle {
@@ -305,7 +306,7 @@ async fn serve_h2(
                 match tokio::time::timeout(Duration::from_secs(10), ping_pong.ping(h2::Ping::opaque())).await {
                     Ok(Ok(_)) => {}
                     _ => {
-                        info!("H2 keepalive PING failed or timed out, connection may be dead");
+                        info!("H2 keepalive PING failed or timed out");
                         sig.notify_one();
                         break;
                     }
