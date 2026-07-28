@@ -71,13 +71,21 @@ async fn main() {
     };
     tx.send(Some(init_h2)).ok();
     // Background: wait for H2 connection to drop, then reconnect.
+    // Uses a 5-minute fallback timeout so a silently hung connection (firewall
+    // drops without RST/FIN) doesn't block reconnection forever.
     // No active PING (don't take PingPong — let connection auto-respond to
     // forward's keepalive PINGs). Silent failures detected by /data retry timeouts.
     tokio::spawn(async move {
         let mut conn = init_conn;
         loop {
-            let _ = (&mut conn).await;
-            info!("H2 connection dropped, reconnecting...");
+            tokio::select! {
+                _ = &mut conn => {
+                    info!("H2 connection dropped, reconnecting...");
+                }
+                _ = tokio::time::sleep(Duration::from_secs(300)) => {
+                    info!("H2 connection idle 5min, reconnecting as precaution...");
+                }
+            }
             loop {
                 match connect_h2(&s4, &s2, s3).await {
                     Ok((h2, new_conn)) => {

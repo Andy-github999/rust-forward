@@ -157,7 +157,7 @@ struct Args {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let default_level = if cfg!(feature = "logging") { "info" } else { "error" };
+    let default_level = if cfg!(debug_assertions) { "info" } else { "error" };
     tracing_subscriber::fmt()
         .with_ansi(false)
         .with_target(false)
@@ -450,8 +450,17 @@ async fn handle_stream(
             .header("x-session-id", sid.to_string())
             .body(())
             .unwrap();
-        let mut send_stream = respond.send_response(resp, false)?;
-        send_stream.send_data(Bytes::from(resp_data), true)?;
+        let mut send_stream = match respond.send_response(resp, false) {
+            Ok(s) => s,
+            Err(e) => {
+                state.sessions.remove(&sid);
+                return Err(e.into());
+            }
+        };
+        if let Err(e) = send_stream.send_data(Bytes::from(resp_data), true) {
+            state.sessions.remove(&sid);
+            return Err(e.into());
+        }
         info!("[/connect] [{}] done (session {})", target, sid);
         return Ok(());
     }
