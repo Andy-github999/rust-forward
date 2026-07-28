@@ -75,6 +75,11 @@ fn dns_remove(cache: &DashMap<String, DnsEntry>, target: &str) {
     }
 }
 
+/// Extract host part from "host:port" string.
+fn target_host(target: &str) -> &str {
+    target.rsplit_once(':').map(|(h, _)| h).unwrap_or(target)
+}
+
 /// Verify HMAC headers + replay protection for a request, in a single call.
 #[derive(Debug)]
 enum AuthError {
@@ -123,6 +128,7 @@ struct AppState {
     sessions: DashMap<SessionId, Arc<Session>>,
     next_id: AtomicU64,
     dns_cache: DashMap<String, DnsEntry>,
+    unreachable: DashMap<String, Instant>,
 }
 
 /// Per-H2-connection state: nonces for replay protection only.
@@ -223,6 +229,7 @@ async fn main() -> Result<()> {
         sessions: DashMap::new(),
         next_id: AtomicU64::new(1),
         dns_cache: DashMap::new(),
+        unreachable: DashMap::new(),
     });
 
     // Global session idle cleanup (one task for entire process)
@@ -238,6 +245,8 @@ async fn main() -> Result<()> {
                 if state_clone.sessions.len() != before {
                     info!("session cleanup: {} -> {}", before, state_clone.sessions.len());
                 }
+                // Expire old unreachable entries (checked on lookup too, this is just GC)
+                state_clone.unreachable.retain(|_, ts| ts.elapsed() < Duration::from_secs(60));
             }
         });
     }
@@ -380,6 +389,17 @@ async fn handle_stream(
             return send_err(respond, 502, msg).await;
         }
 
+        // Skip immediately if target is in unreachable cache (recently failed)
+        let host = target_host(&target).to_string();
+        if let Some(entry) = state.unreachable.get(&host) {
+            if entry.elapsed() < Duration::from_secs(60) {
+                info!("[/connect] [{}] cached unreachable, skip", target);
+                return send_err(respond, 503, "target unreachable").await;
+            }
+            drop(entry);
+            state.unreachable.remove(&host);
+        }
+
         // Read ClientHello from body (loop over all H2 DATA frames)
         let mut helo = Vec::new();
         while let Some(Ok(chunk)) = body.data().await {
@@ -393,7 +413,10 @@ async fn handle_stream(
             info!("[/connect] [{}] via SOCKS5 {}", target, state.socks5_proxy);
             match connect_via_socks5(&state.socks5_proxy, &target, state.connect_timeout).await {
                 Ok(s) => s,
-                Err(e) => return send_err(respond, 502, &format!("socks5: {}", e)).await,
+                Err(e) => {
+                    state.unreachable.insert(host.clone(), Instant::now());
+                    return send_err(respond, 502, &format!("socks5: {}", e)).await;
+                }
             }
         } else {
             // Resolve target via DashMap DNS cache (lock-free per-shard)
@@ -410,10 +433,12 @@ async fn handle_stream(
                 Ok(Ok(s)) => s,
                 Ok(Err(e)) => {
                     dns_remove(&state.dns_cache, &target);
+                    state.unreachable.insert(host.clone(), Instant::now());
                     return send_err(respond, 502, &format!("connect: {}", e)).await;
                 }
                 Err(_) => {
                     dns_remove(&state.dns_cache, &target);
+                    state.unreachable.insert(host.clone(), Instant::now());
                     return send_err(respond, 504, "timeout").await;
                 }
             }
