@@ -6,6 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::sync::watch;
 use rust_forward::*;
 use bytes::Bytes;
+use rand::Rng;
 
 #[derive(Parser, Debug)]
 #[command(name = "bridge", about = "SOCKS5 → H2 bridge for PC")]
@@ -95,8 +96,10 @@ async fn main() {
                             break;
                         }
                         Err(e) => {
-                            error!("H2 reconnect failed: {} (retry in {}s)", e, delay.as_secs());
-                            tokio::time::sleep(delay).await;
+                            let jitter = Duration::from_millis(rand::thread_rng().gen_range(0..=1000));
+                            let sleep_delay = delay + jitter;
+                            error!("H2 reconnect failed: {} (retry in {}s)", e, sleep_delay.as_secs());
+                            tokio::time::sleep(sleep_delay).await;
                             delay = (delay * 2).min(Duration::from_secs(60));
                         }
                     }

@@ -27,8 +27,6 @@ struct Session {
     last_active: AtomicU64,
 }
 
-const DNS_TTL: Duration = Duration::from_secs(300);
-
 /// Maximum concurrent TCP connections (AtomicUsize guard, no kernel wait).
 const MAX_CONN: usize = 64;
 
@@ -38,41 +36,6 @@ struct ConnGuard(Arc<AtomicUsize>);
 impl Drop for ConnGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
-    }
-}
-
-struct DnsEntry {
-    addr: SocketAddr,
-    inserted: Instant,
-}
-
-/// Look up a host:port in the DashMap DNS cache; insert on miss.
-async fn resolve_dns(cache: &DashMap<String, DnsEntry>, target: &str) -> Result<SocketAddr> {
-    let (host, port) = if let Ok(addr) = target.parse::<SocketAddr>() {
-        return Ok(addr);
-    } else {
-        let (h, p) = target.rsplit_once(':').ok_or_else(|| anyhow::anyhow!("invalid target: {}", target))?;
-        (h.to_string(), p.parse::<u16>()?)
-    };
-    if let Some(entry) = cache.get(&host) {
-        if entry.inserted.elapsed() < DNS_TTL {
-            return Ok(entry.addr);
-        }
-        // Expired — fall through to re-resolve
-        drop(entry);
-        cache.remove(&host);
-    }
-    let addrs = tokio::net::lookup_host((host.as_str(), port)).await?;
-    let v4 = addrs.filter(|a| a.is_ipv4()).next()
-        .ok_or_else(|| anyhow::anyhow!("no IPv4 for {}", target))?;
-    cache.insert(host, DnsEntry { addr: v4, inserted: Instant::now() });
-    Ok(v4)
-}
-
-/// Remove a host from the DNS cache on connection failure.
-fn dns_remove(cache: &DashMap<String, DnsEntry>, target: &str) {
-    if let Some((h, _)) = target.rsplit_once(':') {
-        cache.remove(h);
     }
 }
 
@@ -129,7 +92,6 @@ struct AppState {
     sessions: DashMap<SessionId, Arc<Session>>,
     next_id: AtomicU64,
     next_conn_id: AtomicU64,
-    dns_cache: DashMap<String, DnsEntry>,
     unreachable: DashMap<String, Instant>,
 }
 
@@ -231,7 +193,6 @@ async fn main() -> Result<()> {
         sessions: DashMap::new(),
         next_id: AtomicU64::new(1),
         next_conn_id: AtomicU64::new(1),
-        dns_cache: DashMap::new(),
         unreachable: DashMap::new(),
     });
 
@@ -327,11 +288,17 @@ async fn serve_h2(
         });
     }
 
+    // Safety counter: consecutive stream errors without a successful accept.
+    // In h2 0.4, connection-level errors return None (not Some(Err)),
+    // but this guard prevents infinite spinning if behavior differs.
+    let mut stream_errs: u32 = 0;
+
     loop {
         tokio::select! {
             result = h2.accept() => {
                 match result {
                     Some(Ok((req, respond))) => {
+                        stream_errs = 0;
                         let st = state.clone();
                         let cn = conn.clone();
                         let cid = conn_id;
@@ -342,11 +309,15 @@ async fn serve_h2(
                         });
                     }
                     Some(Err(e)) => {
-                        // Stream-level protocol error — log and continue.
-                        // DO NOT break the entire H2 connection — h2 handles
-                        // the offending stream internally. Breaking here would
-                        // kill all other streams on this connection.
-                        warn!("conn {}: H2 stream error: {}", conn_id, e);
+                        stream_errs += 1;
+                        warn!("conn {}: H2 error (consecutive={}): {}", conn_id, stream_errs, e);
+                        if stream_errs > 50 {
+                            // Too many consecutive errors without a single success.
+                            // h2 0.4 should return None for connection-level errors,
+                            // but this guard prevents spinning if it doesn't.
+                            warn!("conn {}: too many consecutive H2 errors, dropping connection", conn_id);
+                            break;
+                        }
                     }
                     None => break,
                 }
@@ -369,7 +340,9 @@ async fn serve_h2(
                                         }
                                     });
                                 }
-                                Some(Err(e)) => warn!("conn {}: stream error during shutdown: {}", conn_id, e),
+                                Some(Err(e)) => {
+                                    warn!("conn {}: stream error during shutdown: {}", conn_id, e);
+                                }
                                 None => {
                                     info!("conn {}: shutdown complete", conn_id);
                                     break;
@@ -467,25 +440,19 @@ async fn handle_stream(
                 }
             }
         } else {
-            // Resolve target via DashMap DNS cache (lock-free per-shard)
-            let target_addr = match resolve_dns(&state.dns_cache, &target).await {
-                Ok(addr) => addr,
-                Err(e) => { return send_err(respond, 502, &format!("dns: {}", e)).await; }
-            };
-            info!("[/connect] [{}] resolved to {}", target, target_addr);
-            let ip_target = format!("{}:{}", target_addr.ip(), target_addr.port());
+            // Connect directly to target — pass the original hostname so
+            // connect_tcp_v4 can resolve DNS and try all resolved IPv4
+            // addresses (CDN multi-IP fallback).
             match tokio::time::timeout(
                 Duration::from_secs(state.connect_timeout),
-                connect_tcp_v4(&ip_target, state.connect_timeout),
+                connect_tcp_v4(&target, state.connect_timeout),
             ).await {
                 Ok(Ok(s)) => s,
                 Ok(Err(e)) => {
-                    dns_remove(&state.dns_cache, &target);
                     state.unreachable.insert(host.clone(), Instant::now());
                     return send_err(respond, 502, &format!("connect: {}", e)).await;
                 }
                 Err(_) => {
-                    dns_remove(&state.dns_cache, &target);
                     state.unreachable.insert(host.clone(), Instant::now());
                     return send_err(respond, 504, "timeout").await;
                 }
