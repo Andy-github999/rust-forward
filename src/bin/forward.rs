@@ -538,15 +538,6 @@ async fn handle_stream(
                     Duration::from_secs(5),
                     Duration::from_millis(100),
                 ).await;
-                if resp.is_empty() && !req_data.is_empty() {
-                    // We sent data but got nothing back — target TCP connection is dead.
-                    // Close the session to reclaim the fd and prevent bridge from
-                    // looping forever on empty responses.
-                    info!("[/data] [sid={}] target closed while data pending, removing session", sid);
-                    state.sessions.remove(&sid);
-                    drop(t);
-                    return send_err(respond, 502, "target closed").await;
-                }
                 if resp.is_empty() {
                     info!("[/data] [sid={}] target no response", sid);
                 }
