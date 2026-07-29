@@ -19,7 +19,9 @@ pub async fn connect_tcp_v4(target: &str, timeout_secs: u64) -> Result<TcpStream
     // Try each resolved IPv4 address with per-address timeout.
     // CDNs often return multiple IPs (e.g. DuckDuckGo); if the first one
     // is rate-limited or temporarily blocked, fall through to the next.
-    let per_addr = Duration::from_secs((timeout_secs as f64 / v4_addrs.len() as f64).ceil() as u64);
+    // Minimum 2s per address prevents tight timeouts on CDNs with many IPs.
+    let per_addr = Duration::from_secs((timeout_secs as f64 / v4_addrs.len() as f64).ceil() as u64)
+        .max(Duration::from_secs(2));
     let mut last_err = None;
     for addr in &v4_addrs {
         match tokio::time::timeout(per_addr, tokio::net::TcpStream::connect(addr)).await {

@@ -532,11 +532,11 @@ async fn handle_stream(
                 let mut t = tm.lock().await;
                 if !req_data.is_empty() { t.write_all(&req_data).await?; }
 
-                // Read target response (idle-batched: 5s first byte, 500ms idle between chunks)
+                // Read target response (idle-batched: 5s first byte, 100ms idle between chunks)
                 let resp = read_until_idle(
                     &mut t,
                     Duration::from_secs(5),
-                    Duration::from_millis(500),
+                    Duration::from_millis(100),
                 ).await;
                 if resp.is_empty() && !req_data.is_empty() {
                     // We sent data but got nothing back — target TCP connection is dead.
