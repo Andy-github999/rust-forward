@@ -12,38 +12,24 @@ pub async fn connect_tcp_v4(target: &str, timeout_secs: u64) -> Result<TcpStream
         (h.to_string(), p.parse()?)
     };
     let addrs = tokio::net::lookup_host((host.as_str(), port)).await?;
-    let v4_addrs: Vec<_> = addrs.filter(|a| a.is_ipv4()).collect();
-    if v4_addrs.is_empty() {
-        return Err(anyhow::anyhow!("no IPv4 address for {}", target));
-    }
-    // Try each resolved IPv4 address with per-address timeout.
-    // CDNs often return multiple IPs (e.g. DuckDuckGo); if the first one
-    // is rate-limited or temporarily blocked, fall through to the next.
-    // Minimum 2s per address prevents tight timeouts on CDNs with many IPs.
-    let per_addr = Duration::from_secs((timeout_secs as f64 / v4_addrs.len() as f64).ceil() as u64)
-        .max(Duration::from_secs(2));
-    let mut last_err = None;
-    for addr in &v4_addrs {
-        match tokio::time::timeout(per_addr, tokio::net::TcpStream::connect(addr)).await {
-            Ok(Ok(stream)) => {
-                // TCP keepalive via socket2 (15s interval)
-                let stream = match stream.into_std() {
-                    Ok(std) => {
-                        use socket2::{SockRef, TcpKeepalive};
-                        let s2 = SockRef::from(&std);
-                        let _ = s2.set_keepalive(true);
-                        let _ = s2.set_tcp_keepalive(&TcpKeepalive::new().with_time(Duration::from_secs(15)));
-                        tokio::net::TcpStream::from_std(std)?
-                    }
-                    Err(e) => return Err(anyhow::anyhow!("into_std: {}", e)),
-                };
-                return Ok(stream);
-            }
-            Ok(Err(e)) => last_err = Some(e),
-            Err(_) => last_err = Some(std::io::Error::new(std::io::ErrorKind::TimedOut, "per-address timeout").into()),
+    let v4 = addrs.filter(|a| a.is_ipv4()).next().ok_or_else(|| anyhow::anyhow!("no IPv4 address for {}", target))?;
+    let stream = tokio::time::timeout(
+        Duration::from_secs(timeout_secs),
+        tokio::net::TcpStream::connect(v4),
+    ).await??;
+
+    // TCP keepalive via socket2 (15s interval)
+    let stream = match stream.into_std() {
+        Ok(std) => {
+            use socket2::{SockRef, TcpKeepalive};
+            let s2 = SockRef::from(&std);
+            let _ = s2.set_keepalive(true);
+            let _ = s2.set_tcp_keepalive(&TcpKeepalive::new().with_time(Duration::from_secs(15)));
+            tokio::net::TcpStream::from_std(std)?
         }
-    }
-    Err(anyhow::anyhow!("connect_tcp_v4: all {} addresses failed: {}", v4_addrs.len(), last_err.as_ref().unwrap()))
+        Err(e) => return Err(anyhow::anyhow!("into_std: {}", e)),
+    };
+    Ok(stream)
 }
 
 /// Connect to a target through a SOCKS5 proxy.

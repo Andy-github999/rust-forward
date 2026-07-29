@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::Parser;
 use std::fs;
 use tracing::{error, info, warn};
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex as StdMutex;
@@ -36,6 +36,58 @@ struct ConnGuard(Arc<AtomicUsize>);
 impl Drop for ConnGuard {
     fn drop(&mut self) {
         self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
+
+const DNS_TTL: Duration = Duration::from_secs(300);
+
+struct DnsEntry {
+    addr: SocketAddr,
+    inserted: Instant,
+}
+
+/// Tracks connection failures per IP. Used by resolve_dns to prefer
+/// IPs that have historically succeeded over those that haven't.
+struct BadIp {
+    count: u32,
+    last_fail: Instant,
+}
+
+/// Look up a host:port in the DashMap DNS cache, preferring IPs with
+/// fewer historical failures. Inserts the best candidate on cache miss.
+async fn resolve_dns(cache: &DashMap<String, DnsEntry>, bad_ips: &DashMap<IpAddr, BadIp>, target: &str) -> Result<SocketAddr> {
+    let (host, port) = if let Ok(addr) = target.parse::<SocketAddr>() {
+        return Ok(addr);
+    } else {
+        let (h, p) = target.rsplit_once(':').ok_or_else(|| anyhow::anyhow!("invalid target: {}", target))?;
+        (h.to_string(), p.parse::<u16>()?)
+    };
+    if let Some(entry) = cache.get(&host) {
+        if entry.inserted.elapsed() < DNS_TTL {
+            return Ok(entry.addr);
+        }
+        // Expired — fall through to re-resolve
+        drop(entry);
+        cache.remove(&host);
+    }
+    let addrs = tokio::net::lookup_host((host.as_str(), port)).await?;
+    let mut v4s: Vec<_> = addrs.filter(|a| a.is_ipv4()).collect();
+    if v4s.is_empty() {
+        return Err(anyhow::anyhow!("no IPv4 for {}", target));
+    }
+    // Decay old failures (>5min = forget)
+    bad_ips.retain(|_, bi| bi.last_fail.elapsed() < Duration::from_secs(300));
+    // Sort by failure count, so IPs that have worked before are preferred
+    v4s.sort_by_key(|addr| bad_ips.get(&addr.ip()).map(|bi| bi.count).unwrap_or(0));
+    let chosen = v4s[0];
+    cache.insert(host, DnsEntry { addr: chosen, inserted: Instant::now() });
+    Ok(chosen)
+}
+
+/// Remove a host from the DNS cache on connection failure.
+fn dns_remove(cache: &DashMap<String, DnsEntry>, target: &str) {
+    if let Some((h, _)) = target.rsplit_once(':') {
+        cache.remove(h);
     }
 }
 
@@ -92,6 +144,8 @@ struct AppState {
     sessions: DashMap<SessionId, Arc<Session>>,
     next_id: AtomicU64,
     next_conn_id: AtomicU64,
+    dns_cache: DashMap<String, DnsEntry>,
+    bad_ips: DashMap<IpAddr, BadIp>,
     unreachable: DashMap<String, Instant>,
 }
 
@@ -193,6 +247,8 @@ async fn main() -> Result<()> {
         sessions: DashMap::new(),
         next_id: AtomicU64::new(1),
         next_conn_id: AtomicU64::new(1),
+        dns_cache: DashMap::new(),
+        bad_ips: DashMap::new(),
         unreachable: DashMap::new(),
     });
 
@@ -440,19 +496,30 @@ async fn handle_stream(
                 }
             }
         } else {
-            // Connect directly to target — pass the original hostname so
-            // connect_tcp_v4 can resolve DNS and try all resolved IPv4
-            // addresses (CDN multi-IP fallback).
+            // Resolve target via DashMap DNS cache (lock-free per-shard)
+            let target_addr = match resolve_dns(&state.dns_cache, &state.bad_ips, &target).await {
+                Ok(addr) => addr,
+                Err(e) => { return send_err(respond, 502, &format!("dns: {}", e)).await; }
+            };
+            let ip_target = format!("{}:{}", target_addr.ip(), target_addr.port());
             match tokio::time::timeout(
                 Duration::from_secs(state.connect_timeout),
-                connect_tcp_v4(&target, state.connect_timeout),
+                connect_tcp_v4(&ip_target, state.connect_timeout),
             ).await {
                 Ok(Ok(s)) => s,
                 Ok(Err(e)) => {
+                    let mut bip = state.bad_ips.entry(target_addr.ip()).or_insert_with(|| BadIp { count: 0, last_fail: Instant::now() });
+                    bip.count += 1;
+                    bip.last_fail = Instant::now();
+                    dns_remove(&state.dns_cache, &target);
                     state.unreachable.insert(host.clone(), Instant::now());
                     return send_err(respond, 502, &format!("connect: {}", e)).await;
                 }
                 Err(_) => {
+                    let mut bip = state.bad_ips.entry(target_addr.ip()).or_insert_with(|| BadIp { count: 0, last_fail: Instant::now() });
+                    bip.count += 1;
+                    bip.last_fail = Instant::now();
+                    dns_remove(&state.dns_cache, &target);
                     state.unreachable.insert(host.clone(), Instant::now());
                     return send_err(respond, 504, "timeout").await;
                 }
