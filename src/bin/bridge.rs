@@ -88,13 +88,9 @@ async fn main() {
             }
             loop {
                 let mut delay = Duration::from_secs(5);
-                loop {
+                let (h2, new_conn) = loop {
                     match connect_h2(&s4, &s2, s3).await {
-                        Ok((h2, new_conn)) => {
-                            tx_reconnect.send(Some(h2)).ok();
-                            conn = new_conn;
-                            break;
-                        }
+                        Ok(pair) => break pair,
                         Err(e) => {
                             let jitter = Duration::from_millis(rand::thread_rng().gen_range(0..=1000));
                             let sleep_delay = delay + jitter;
@@ -103,7 +99,10 @@ async fn main() {
                             delay = (delay * 2).min(Duration::from_secs(60));
                         }
                     }
-                }
+                };
+                tx_reconnect.send(Some(h2)).ok();
+                conn = new_conn;
+                break;
             }
         }
     });
