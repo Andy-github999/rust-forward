@@ -22,6 +22,7 @@ fn now_ms() -> u64 {
 }
 
 struct Session {
+    conn_id: u64,
     target: Arc<tokio::sync::Mutex<tokio::net::TcpStream>>,
     last_active: AtomicU64,
 }
@@ -127,6 +128,7 @@ struct AppState {
     socks5_proxy: String,
     sessions: DashMap<SessionId, Arc<Session>>,
     next_id: AtomicU64,
+    next_conn_id: AtomicU64,
     dns_cache: DashMap<String, DnsEntry>,
     unreachable: DashMap<String, Instant>,
 }
@@ -228,6 +230,7 @@ async fn main() -> Result<()> {
         socks5_proxy,
         sessions: DashMap::new(),
         next_id: AtomicU64::new(1),
+        next_conn_id: AtomicU64::new(1),
         dns_cache: DashMap::new(),
         unreachable: DashMap::new(),
     });
@@ -289,13 +292,14 @@ async fn serve_h2(
     tls_stream: tokio_rustls::TlsStream<tokio::net::TcpStream>,
     state: Arc<AppState>,
 ) -> Result<()> {
+    let conn_id = state.next_conn_id.fetch_add(1, Ordering::Relaxed);
     let mut h2 = h2::server::Builder::new()
         .max_concurrent_streams(256)
         .initial_window_size(4_194_304)
         .initial_connection_window_size(33_554_432)
         .handshake(tls_stream)
         .await?;
-    info!("H2 connection established");
+    info!("conn {}: H2 connection established", conn_id);
 
     let conn = Arc::new(ConnState {
         nonces: StdMutex::new(Vec::new()),
@@ -303,7 +307,6 @@ async fn serve_h2(
     });
 
     // H2 keepalive: send PING every 20s to prevent Cloudflare Edge from timing out.
-    // Bridge no longer takes PingPong, so its connection auto-responds with PONG.
     // If PING fails (connection truly dead), signal shutdown to free the fd.
     let ping_handle = h2.ping_pong();
     let shutdown = Arc::new(Notify::new());
@@ -315,7 +318,7 @@ async fn serve_h2(
                 match tokio::time::timeout(Duration::from_secs(10), ping_pong.ping(h2::Ping::opaque())).await {
                     Ok(Ok(_)) => {}
                     _ => {
-                        info!("H2 keepalive PING failed or timed out");
+                        info!("conn: H2 keepalive PING failed or timed out");
                         sig.notify_one();
                         break;
                     }
@@ -331,25 +334,69 @@ async fn serve_h2(
                     Some(Ok((req, respond))) => {
                         let st = state.clone();
                         let cn = conn.clone();
+                        let cid = conn_id;
                         tokio::spawn(async move {
-                            if let Err(e) = handle_stream(req, respond, &st, &cn).await {
+                            if let Err(e) = handle_stream(req, respond, &st, &cn, cid).await {
                                 warn!("stream: {}", e);
                             }
                         });
                     }
                     Some(Err(e)) => {
-                        warn!("H2 accept error: {}", e);
-                        break;
+                        // Stream-level protocol error — log and continue.
+                        // DO NOT break the entire H2 connection — h2 handles
+                        // the offending stream internally. Breaking here would
+                        // kill all other streams on this connection.
+                        warn!("conn {}: H2 stream error: {}", conn_id, e);
                     }
                     None => break,
                 }
             }
             _ = shutdown.notified() => {
-                info!("H2 connection shutdown by keepalive failure, releasing fd");
+                info!("conn {}: graceful shutdown...", conn_id);
+                h2.graceful_shutdown();
+                // Wait for existing streams to complete (max 5s)
+                loop {
+                    tokio::select! {
+                        result = h2.accept() => {
+                            match result {
+                                Some(Ok((req, respond))) => {
+                                    let st = state.clone();
+                                    let cn = conn.clone();
+                                    let cid = conn_id;
+                                    tokio::spawn(async move {
+                                        if let Err(e) = handle_stream(req, respond, &st, &cn, cid).await {
+                                            warn!("stream: {}", e);
+                                        }
+                                    });
+                                }
+                                Some(Err(e)) => warn!("conn {}: stream error during shutdown: {}", conn_id, e),
+                                None => {
+                                    info!("conn {}: shutdown complete", conn_id);
+                                    break;
+                                }
+                            }
+                        }
+                        _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                            info!("conn {}: shutdown timeout, forcing close", conn_id);
+                            break;
+                        }
+                    }
+                }
                 break;
             }
         }
     }
+
+    // Clean up sessions owned by this connection (prevents fd leaks on unclean
+    // disconnects, e.g., bridge killed, Chrome closed, network drop).
+    // Always runs — it's idempotent and harmless even on graceful shutdown.
+    let before = state.sessions.len();
+    state.sessions.retain(|_, s| s.conn_id != conn_id);
+    let removed = before - state.sessions.len();
+    if removed > 0 {
+        info!("conn {}: cleaned {} sessions (target fds released)", conn_id, removed);
+    }
+
     Ok(())
 }
 
@@ -358,6 +405,7 @@ async fn handle_stream(
     mut respond: h2::server::SendResponse<Bytes>,
     state: &AppState,
     conn: &ConnState,
+    conn_id: u64,
 ) -> Result<()> {
     let (head, mut body) = request.into_parts();
     let path = head.uri.path_and_query()
@@ -466,6 +514,7 @@ async fn handle_stream(
         let sid = state.next_id.fetch_add(1, Ordering::Relaxed);
         let tgt = Arc::new(Mutex::new(target_stream));
         state.sessions.insert(sid, Arc::new(Session {
+            conn_id,
             target: tgt,
             last_active: AtomicU64::new(now_ms()),
         }));
@@ -516,12 +565,21 @@ async fn handle_stream(
                 let mut t = tm.lock().await;
                 if !req_data.is_empty() { t.write_all(&req_data).await?; }
 
-                // Read target response (idle-batched: 5s first byte, 100ms idle between chunks)
+                // Read target response (idle-batched: 5s first byte, 500ms idle between chunks)
                 let resp = read_until_idle(
                     &mut t,
                     Duration::from_secs(5),
-                    Duration::from_millis(100),
+                    Duration::from_millis(500),
                 ).await;
+                if resp.is_empty() && !req_data.is_empty() {
+                    // We sent data but got nothing back — target TCP connection is dead.
+                    // Close the session to reclaim the fd and prevent bridge from
+                    // looping forever on empty responses.
+                    info!("[/data] [sid={}] target closed while data pending, removing session", sid);
+                    state.sessions.remove(&sid);
+                    drop(t);
+                    return send_err(respond, 502, "target closed").await;
+                }
                 if resp.is_empty() {
                     info!("[/data] [sid={}] target no response", sid);
                 }

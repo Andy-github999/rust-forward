@@ -73,8 +73,7 @@ async fn main() {
     // Background: wait for H2 connection to drop, then reconnect.
     // Uses a 5-minute fallback timeout so a silently hung connection (firewall
     // drops without RST/FIN) doesn't block reconnection forever.
-    // No active PING (don't take PingPong — let connection auto-respond to
-    // forward's keepalive PINGs). Silent failures detected by /data retry timeouts.
+    // Active PING keepalive in connect_h2() prevents Edge from idling out.
     tokio::spawn(async move {
         let mut conn = init_conn;
         loop {
@@ -87,15 +86,19 @@ async fn main() {
                 }
             }
             loop {
-                match connect_h2(&s4, &s2, s3).await {
-                    Ok((h2, new_conn)) => {
-                        tx_reconnect.send(Some(h2)).ok();
-                        conn = new_conn;
-                        break;
-                    }
-                    Err(e) => {
-                        error!("H2 reconnect failed: {} (retry in 5s)", e);
-                        tokio::time::sleep(Duration::from_secs(5)).await;
+                let mut delay = Duration::from_secs(5);
+                loop {
+                    match connect_h2(&s4, &s2, s3).await {
+                        Ok((h2, new_conn)) => {
+                            tx_reconnect.send(Some(h2)).ok();
+                            conn = new_conn;
+                            break;
+                        }
+                        Err(e) => {
+                            error!("H2 reconnect failed: {} (retry in {}s)", e, delay.as_secs());
+                            tokio::time::sleep(delay).await;
+                            delay = (delay * 2).min(Duration::from_secs(60));
+                        }
                     }
                 }
             }
@@ -387,11 +390,26 @@ async fn connect_h2(addr: &str, server_name: &str, _insecure: bool) -> anyhow::R
     let sn = ServerName::try_from(cn.clone())
         .map_err(|e| anyhow::anyhow!("server name: {:?}", e))?;
     let tls = TlsConnector::from(cfg).connect(sn, tcp).await?;
-    let (h2, conn) = h2::client::Builder::new()
+    let (h2, mut conn) = h2::client::Builder::new()
         .max_concurrent_streams(256)
         .initial_window_size(4_194_304)
         .initial_connection_window_size(33_554_432)
         .handshake(tls).await?;
+
+    // Bridge→Edge keepalive: send PING every 25s to prevent Edge idle timeout (~60-120s).
+    // Without this, Edge silently drops the connection after ~60s of inactivity,
+    // causing the next /data or /connect to get BROKEN PIPE / PROTOCOL_ERROR.
+    if let Some(mut pp) = conn.ping_pong() {
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(25)).await;
+                if tokio::time::timeout(Duration::from_secs(10), pp.ping(h2::Ping::opaque())).await.is_err() {
+                    break; // PING failed → connection dead
+                }
+            }
+        });
+    }
+
     info!("H2 connected to {}", addr);
     Ok((h2, conn))
 }
