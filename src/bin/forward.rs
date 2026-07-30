@@ -1,6 +1,6 @@
 use clap::Parser;
 use log::{error, info, warn};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -22,6 +22,8 @@ struct Session {
     conn_id: u64,
     target: tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>,
     last_active: AtomicU64,
+    next_seq: AtomicU64,
+    pending: tokio::sync::Mutex<BTreeMap<u64, Vec<u8>>>,
 }
 
 struct AppState {
@@ -328,6 +330,8 @@ async fn handle_h2_stream(
             conn_id,
             target: tokio::sync::Mutex::new(target_w),
             last_active: AtomicU64::new(now_ms()),
+            pending: tokio::sync::Mutex::new(BTreeMap::new()),
+            next_seq: AtomicU64::new(0),
         });
         state.sessions.write().await.insert(sid, session);
 
@@ -377,9 +381,18 @@ async fn handle_h2_stream(
 
     // ===== POST /tunnel/data =====
     if path.starts_with("/tunnel/data") {
-        let mut sid: SessionId = head.headers.get("x-session-id")
+        let sid: SessionId = head.headers.get("x-session-id")
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse().ok())
+            .unwrap_or(0);
+
+        // Parse seq from query string
+        let seq: u64 = head.uri.query()
+            .and_then(|q| {
+                q.split('&')
+                    .find(|p| p.starts_with("seq="))
+                    .and_then(|s| s[4..].parse().ok())
+            })
             .unwrap_or(0);
 
         // Read body
@@ -392,14 +405,31 @@ async fn handle_h2_stream(
         match session {
             Some(s) => {
                 if !req_data.is_empty() {
-                    let mut t = s.target.lock().await;
-                    let _ = t.write_all(&req_data).await;
-                    drop(t);
+                    let mut pend = s.pending.lock().await;
+                    let expected = s.next_seq.load(Ordering::Relaxed);
+                    if seq == expected {
+                        // In-order, write directly
+                        let mut t = s.target.lock().await;
+                        let _ = t.write_all(&req_data).await;
+                        drop(t);
+                        s.next_seq.store(expected + 1, Ordering::Relaxed);
+                        let mut seq_now = expected + 1;
+                        // Flush pending
+                        while let Some(data) = pend.remove(&seq_now) {
+                            let mut t = s.target.lock().await;
+                            let _ = t.write_all(&data).await;
+                            drop(t);
+                            seq_now += 1;
+                        }
+                        s.next_seq.store(seq_now, Ordering::Relaxed);
+                    } else if seq > expected {
+                        // Out-of-order, buffer
+                        pend.insert(seq, req_data);
+                        info!("[/data] [sid={}] buffered seq={}, expect={}", sid, seq, expected);
+                    }
+                    drop(pend);
                     s.last_active.store(now_ms(), Ordering::Relaxed);
-                    info!("[/data] [sid={}] wrote {} bytes", sid, req_data.len());
                 }
-                // Return immediately, no read_until_idle.
-                // Target→Chrome data streams through /connect response body.
                 let resp_http = http::Response::builder()
                     .status(200)
                     .body(())

@@ -195,7 +195,6 @@ async fn handle_socks5(
     server_name: &str,
     buf_size: usize,
 ) -> anyhow::Result<()> {
-    use bytes::Bytes;
     use tokio::io::AsyncWriteExt;
 
     // SOCKS5 handshake
@@ -293,18 +292,21 @@ async fn handle_socks5(
         let _ = stream1.finish().await;
     });
 
-    // 主循环: 读 SOCKS5 客户端数据 → POST /tunnel/data (raw binary)
-    let mut data = Vec::with_capacity(buf_size);
+    // 主循环: 读客户端数据 → 并发 POST /tunnel/data (seq)
+    let err_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let mut seq = 0u64;
     loop {
-        data.clear();
-        // read_buf 确保 data.len() 不会超过 buf_size
+        if err_flag.load(std::sync::atomic::Ordering::Relaxed) {
+            break;
+        }
+        let mut data = Vec::with_capacity(buf_size);
         data.resize(buf_size, 0);
         let n = match tcp_r.read(&mut data).await {
             Ok(0) => break,
             Ok(n) => n,
             Err(_) => break,
         };
-        // 还可能有更多数据（非阻塞 try_read）
+        // try_read more data
         let mut total = n;
         let mut more = [0u8; 65536];
         loop {
@@ -320,37 +322,39 @@ async fn handle_socks5(
         }
         data.truncate(total);
 
-        let body_bytes = Bytes::copy_from_slice(&data);
-        let cl = body_bytes.len();
+        let seq_no = seq;
+        seq += 1;
+        let data_bytes = Bytes::copy_from_slice(&data);
+        let sid = session_id.clone();
+        let sn = server_name.to_string();
+        let mut h3c = send_request.clone();
+        let flag = err_flag.clone();
 
-        // H3 stream: POST /tunnel/data?sid=xxx
-        let req_data = http::Request::builder()
-            .method("POST")
-            .uri(format!("https://{}/tunnel/data?sid={}", server_name, session_id))
-            .header("x-session-id", &session_id)
-            .header("content-length", cl.to_string().as_str())
-            .body(())
-            .unwrap();
-
-        match send_request.send_request(req_data).await {
-            Ok(mut s) => {
-                let _ = s.send_data(body_bytes).await;
-                let _ = s.finish().await;
-                let r = s.recv_response().await;
-                if let Ok(rp) = r {
-                    if rp.status() == http::StatusCode::OK {
-                        // ack — ignore body
-                        // target→Chrome data flows through /connect response body
-                    } else {
-                        log::warn!("[{}] data POST failed: {}", addr, rp.status());
-                        break;
+        tokio::spawn(async move {
+            let req_data = http::Request::builder()
+                .method("POST")
+                .uri(format!("https://{}/tunnel/data?sid={}&seq={}", sn, sid, seq_no))
+                .header("x-session-id", &sid)
+                .header("content-length", data_bytes.len().to_string().as_str())
+                .body(())
+                .unwrap();
+            match h3c.send_request(req_data).await {
+                Ok(mut s) => {
+                    let _ = s.send_data(data_bytes).await;
+                    let _ = s.finish().await;
+                    if let Ok(rp) = s.recv_response().await {
+                        if rp.status() != http::StatusCode::OK {
+                            warn!("[/data] seq={} status={}", seq_no, rp.status());
+                            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                        }
                     }
-                } else {
-                    break;
+                }
+                Err(e) => {
+                    warn!("[/data] seq={} err: {}", seq_no, e);
+                    flag.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
-            Err(_) => break,
-        }
+        });
     }
 
     Ok(())
