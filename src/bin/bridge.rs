@@ -83,7 +83,10 @@ async fn main() {
                     cfg.alpn_protocols = vec![ALPN.to_vec()];
                     cfg
                 } else {
-                    let roots = rustls::RootCertStore::empty();
+                    let mut roots = rustls::RootCertStore::empty();
+                    roots.extend(
+                        webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
+                    );
                     let mut cfg = rustls::ClientConfig::builder()
                         .with_root_certificates(roots)
                         .with_no_client_auth();
