@@ -13,6 +13,8 @@ use bytes::Bytes;
 
 type SessionId = u64;
 
+const MAX_PENDING: usize = 2048;
+
 fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64
@@ -316,7 +318,7 @@ async fn handle_h2_stream(
             .and_then(|q| {
                 q.split('&')
                     .find(|p| p.starts_with("seq="))
-                    .and_then(|s| s[4..].parse().ok())
+                    .and_then(|s| s.get(4..).and_then(|v| v.parse().ok()))
             })
             .unwrap_or(0);
 
@@ -324,6 +326,7 @@ async fn handle_h2_stream(
         let mut req_data = Vec::new();
         while let Some(Ok(chunk)) = body.data().await {
             req_data.extend_from_slice(&chunk);
+            let _ = body.flow_control().release_capacity(chunk.len());
         }
 
         let session = state.sessions.read().await.get(&sid).cloned();
@@ -348,9 +351,16 @@ async fn handle_h2_stream(
                         }
                         s.next_seq.store(seq_now, Ordering::Relaxed);
                     } else if seq > expected {
-                        // Out-of-order, buffer
-                        pend.insert(seq, req_data);
-                        info!("[/data] [sid={}] buffered seq={}, expect={}", sid, seq, expected);
+                        // Out-of-order, buffer (with cap)
+                        if pend.len() < MAX_PENDING {
+                            pend.insert(seq, req_data);
+                            info!("[/data] [sid={}] buffered seq={}, expect={}, pending={}", sid, seq, expected, pend.len());
+                        } else {
+                            warn!("[/data] [sid={}] pending overflow (>{}) at seq={}, dropping connection", sid, MAX_PENDING, seq);
+                            return Ok(());
+                        }
+                    } else {
+                        warn!("[/data] [sid={}] stale seq={} < expect={}", sid, seq, expected);
                     }
                     drop(pend);
                     s.last_active.store(now_ms(), Ordering::Relaxed);

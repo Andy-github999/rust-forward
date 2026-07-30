@@ -331,6 +331,9 @@ async fn handle_socks5(
         let flag = err_flag.clone();
 
         tokio::spawn(async move {
+            if flag.load(std::sync::atomic::Ordering::Relaxed) {
+                return;
+            }
             let req_data = http::Request::builder()
                 .method("POST")
                 .uri(format!("https://{}/tunnel/data?sid={}&seq={}", sn, sid, seq_no))
