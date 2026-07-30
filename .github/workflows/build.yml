@@ -25,8 +25,8 @@ jobs:
       - run: cargo build --release --bin forward
       - uses: ncipollo/release-action@v1
         with:
-          name: "Windows build ${{ github.run_id }}"
-          tag: win-${{ github.run_id }}
+          name: "Windows build ${{ github.run_id }} (${{ github.ref_name }})"
+          tag: win-${{ github.ref_name }}-${{ github.run_id }}
           artifacts: |
             target/release/bridge.exe
             target/release/forward.exe
@@ -48,8 +48,8 @@ jobs:
         run: cargo zigbuild --release --target aarch64-unknown-linux-musl --bin forward
       - uses: ncipollo/release-action@v1
         with:
-          name: "OpenWrt build ${{ github.run_id }}"
-          tag: openwrt-${{ github.run_id }}
+          name: "OpenWrt build ${{ github.run_id }} (${{ github.ref_name }})"
+          tag: openwrt-${{ github.ref_name }}-${{ github.run_id }}
           artifacts: |
             target/aarch64-unknown-linux-musl/release/bridge
             target/aarch64-unknown-linux-musl/release/forward
