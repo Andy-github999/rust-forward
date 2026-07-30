@@ -357,7 +357,8 @@ async fn handle_h2_stream(
                             info!("[/data] [sid={}] buffered seq={}, expect={}, pending={}", sid, seq, expected, pend.len());
                         } else {
                             warn!("[/data] [sid={}] pending overflow (>{}) at seq={}, dropping connection", sid, MAX_PENDING, seq);
-                            return Ok(());
+                            drop(pend);
+                            return send_h2_err(respond, 503, "pending overflow").await;
                         }
                     } else {
                         warn!("[/data] [sid={}] stale seq={} < expect={}", sid, seq, expected);

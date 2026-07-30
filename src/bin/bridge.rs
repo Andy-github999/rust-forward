@@ -295,6 +295,7 @@ async fn handle_socks5(
     // 主循环: 读客户端数据 → 并发 POST /tunnel/data (seq)
     let err_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut seq = 0u64;
+    let sem = Arc::new(tokio::sync::Semaphore::new(16));
     loop {
         if err_flag.load(std::sync::atomic::Ordering::Relaxed) {
             break;
@@ -330,7 +331,10 @@ async fn handle_socks5(
         let mut h3c = send_request.clone();
         let flag = err_flag.clone();
 
+        // Wait for semaphore permit (backpressure: limits concurrent /data streams)
+        let permit = sem.clone().acquire_owned().await.unwrap();
         tokio::spawn(async move {
+            let _permit = permit; // held until task exits
             if flag.load(std::sync::atomic::Ordering::Relaxed) {
                 return;
             }
