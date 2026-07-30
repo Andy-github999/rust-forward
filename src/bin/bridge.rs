@@ -1,4 +1,4 @@
-use bytes::Buf;
+use bytes::Bytes;
 use clap::Parser;
 use log::{error, info, warn};
 use std::net::SocketAddr;
@@ -16,17 +16,15 @@ type SharedH3Client = Arc<RwLock<Option<H3SendRequest>>>;
 struct Args {
     #[arg(long, default_value = "127.0.0.1:1080")]
     listen: String,
-    /// Forward QUIC address (host:port or ip:port, env: RUST_FORWARD_CONNECT)
     #[arg(long)]
     connect: Option<String>,
-    /// TLS server name (for SNI and cert verification)
     #[arg(long, default_value = "forward.local")]
     server_name: String,
     #[arg(long)]
     password: Option<String>,
     #[arg(long, default_value_t = false)]
     insecure: bool,
-    #[arg(long, default_value = "65536")]
+    #[arg(long, default_value = "1048576")]
     buf_size: usize,
 }
 
@@ -249,28 +247,16 @@ async fn handle_socks5(
         _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
     }
 
-    // ===== Stream 1: POST /connect =====
-    let json_prefix = format!(
-        "{{\"target\":\"{}\",\"password\":\"{}\"",
-        target, password
-    );
-    let mut req_body = json_prefix.into_bytes();
-    if !first_data.is_empty() {
-        req_body.extend_from_slice(b",\"data_hex\":\"");
-        for b in &first_data {
-            req_body.extend_from_slice(format!("{:02x}", b).as_bytes());
-        }
-        req_body.extend_from_slice(b"\"");
-    }
-    req_body.push(b'}');
-    let body_bytes = Bytes::from(req_body);
-    let content_len = body_bytes.len();
+    // ===== Stream 1: POST /tunnel/connect (headers + raw body) =====
+    let body_bytes = Bytes::from(first_data);
+    let cl = body_bytes.len();
 
     let req = http::Request::builder()
         .method("POST")
-        .uri(format!("https://{}/connect", server_name))
-        .header("content-type", "application/json")
-        .header("content-length", content_len.to_string().as_str())
+        .uri(format!("https://{}/tunnel/connect", server_name))
+        .header("x-target", &target)
+        .header("x-auth", password)
+        .header("content-length", cl.to_string().as_str())
         .body(())
         .unwrap();
     let mut stream1 = send_request.send_request(req).await?;
@@ -293,42 +279,55 @@ async fn handle_socks5(
     log::info!("[{}] session {} established", addr, session_id);
 
     // 拆 SOCKS5 TCP
-    let (mut tcp_r, mut tcp_w) = tcp.into_split();
+    let (mut tcp_r, tcp_w) = tcp.into_split();
+    let tcp_w = Arc::new(tokio::sync::Mutex::new(tcp_w));
 
     // 后台任务: stream1.recv_data() → tcp_w (target→client)
+    let bg_w = tcp_w.clone();
     tokio::spawn(async move {
         while let Ok(Some(mut chunk)) = stream1.recv_data().await {
-            if tcp_w.write_all_buf(&mut chunk).await.is_err() {
+            if bg_w.lock().await.write_all_buf(&mut chunk).await.is_err() {
                 break;
             }
         }
         let _ = stream1.finish().await;
     });
 
-    // 主循环: 读 SOCKS5 客户端数据 → POST /data
+    // 主循环: 读 SOCKS5 客户端数据 → POST /tunnel/data (raw binary)
+    let mut data = Vec::with_capacity(buf_size);
     loop {
-        let mut data = vec![0u8; buf_size];
+        data.clear();
+        // read_buf 确保 data.len() 不会超过 buf_size
+        data.resize(buf_size, 0);
         let n = match tcp_r.read(&mut data).await {
             Ok(0) => break,
             Ok(n) => n,
             Err(_) => break,
         };
-        data.truncate(n);
-
-        // 编码为 hex
-        let mut hex = String::with_capacity(data.len() * 2);
-        for b in &data {
-            hex.push_str(&format!("{:02x}", b));
+        // 还可能有更多数据（非阻塞 try_read）
+        let mut total = n;
+        let mut more = [0u8; 65536];
+        loop {
+            match tcp_r.try_read(&mut more) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if total + n <= buf_size {
+                        data[total..total+n].copy_from_slice(&more[..n]);
+                        total += n;
+                    } else { break; }
+                }
+            }
         }
-        let body = format!("{{\"id\":\"{}\",\"data_hex\":\"{}\"}}", session_id, hex);
-        let body_bytes = Bytes::from(body);
+        data.truncate(total);
+
+        let body_bytes = Bytes::copy_from_slice(&data);
         let cl = body_bytes.len();
 
-        // 新 H3 stream: POST /data?id=xxx
+        // H3 stream: POST /tunnel/data?sid=xxx
         let req_data = http::Request::builder()
             .method("POST")
-            .uri(format!("https://{}/data?id={}", server_name, session_id))
-            .header("content-type", "application/json")
+            .uri(format!("https://{}/tunnel/data?sid={}", server_name, session_id))
+            .header("x-session-id", &session_id)
             .header("content-length", cl.to_string().as_str())
             .body(())
             .unwrap();
@@ -341,6 +340,7 @@ async fn handle_socks5(
                 if let Ok(rp) = r {
                     if rp.status() == http::StatusCode::OK {
                         // ack — ignore body
+                        // target→Chrome data flows through /connect response body
                     } else {
                         log::warn!("[{}] data POST failed: {}", addr, rp.status());
                         break;
