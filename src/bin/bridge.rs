@@ -325,14 +325,23 @@ async fn handle_socks5(
 
         let seq_no = seq;
         seq += 1;
-        let data_bytes = Bytes::copy_from_slice(&data);
+        let data_bytes = Bytes::from(data);
         let sid = session_id.clone();
         let sn = server_name.to_string();
         let mut h3c = send_request.clone();
         let flag = err_flag.clone();
 
-        // Wait for semaphore permit (backpressure: limits concurrent /data streams)
-        let permit = sem.clone().acquire_owned().await.unwrap();
+        // Wait for semaphore permit, but check err_flag during wait
+        let permit = loop {
+            if err_flag.load(std::sync::atomic::Ordering::Relaxed) {
+                break None;
+            }
+            match sem.clone().try_acquire_owned() {
+                Ok(p) => break Some(p),
+                Err(_) => tokio::time::sleep(Duration::from_millis(10)).await,
+            }
+        };
+        let Some(permit) = permit else { break; };
         tokio::spawn(async move {
             let _permit = permit; // held until task exits
             if flag.load(std::sync::atomic::Ordering::Relaxed) {

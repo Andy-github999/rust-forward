@@ -21,7 +21,6 @@ fn now_ms() -> u64 {
 }
 
 struct Session {
-    conn_id: u64,
     target: tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>,
     last_active: AtomicU64,
     next_seq: AtomicU64,
@@ -186,7 +185,7 @@ async fn handle_h2_stream(
     request: http::Request<h2::RecvStream>,
     mut respond: h2::server::SendResponse<Bytes>,
     state: &Arc<AppState>,
-    conn_id: u64,
+    _conn_id: u64,
 ) -> anyhow::Result<()> {
     let (head, mut body) = request.into_parts();
     let path = head.uri.path_and_query()
@@ -254,7 +253,6 @@ async fn handle_h2_stream(
         let sid = state.next_id.fetch_add(1, Ordering::Relaxed);
         let (mut target_r, target_w) = target_stream.into_split();
         let session = Arc::new(Session {
-            conn_id,
             target: tokio::sync::Mutex::new(target_w),
             last_active: AtomicU64::new(now_ms()),
             pending: tokio::sync::Mutex::new(BTreeMap::new()),
@@ -279,23 +277,48 @@ async fn handle_h2_stream(
         // Pipe target→Chrome data through the open response body
         // This is the ONLY path for target→Chrome streaming
         info!("[/connect] [{}] session {}, piping target→client", target, sid);
+        // Clone Arc so we avoid RwLock lookups on every iteration
+        let session_arc = state.sessions.read().await.get(&sid).cloned();
         let mut buf = vec![0u8; 65536];
         loop {
             match tokio::time::timeout(
-                Duration::from_secs(state.connect_timeout),
+                Duration::from_secs(30),
                 target_r.read(&mut buf),
             ).await {
                 Ok(Ok(0)) => break,
                 Ok(Ok(n)) => {
-                    if send_stream.send_data(Bytes::copy_from_slice(&buf[..n]), false).is_err() {
+                    let chunk = Bytes::copy_from_slice(&buf[..n]);
+                    if send_stream.send_data(chunk, false).is_err() {
                         break;
                     }
                     // Update last active
-                    if let Some(s) = state.sessions.read().await.get(&sid) {
+                    if let Some(ref s) = session_arc {
                         s.last_active.store(now_ms(), Ordering::Relaxed);
                     }
                 }
-                _ => break,
+                Ok(Err(e)) => {
+                    warn!("[/connect] target read error: {}", e);
+                    break;
+                }
+                Err(_) => {
+                    // Timeout: don't immediately break - the session may still
+                    // be active via /tunnel/data writes. Only break if both
+                    // directions have been idle for the full idle threshold.
+                    //
+                    // last_active is updated by:
+                    //   - this loop (when target data arrives)
+                    //   - the /tunnel/data handler (when bridge sends data)
+                    match session_arc {
+                        Some(ref s) => {
+                            let last = s.last_active.load(Ordering::Relaxed);
+                            if last < now_ms() - 60_000 {
+                                info!("[/connect] [{}] session {} idle >60s, closing", target, sid);
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
             }
         }
         // Target connection closed, end the response stream
