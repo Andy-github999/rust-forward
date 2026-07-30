@@ -292,6 +292,12 @@ async fn handle_h2_stream(
         if target.is_empty() {
             return send_h2_err(respond, 400, "no target").await;
         }
+        let auth = head.headers.get("x-auth")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if !state.password.is_empty() && auth != state.password {
+            return send_h2_err(respond, 403, "bad auth").await;
+        }
 
         // Connect to target (via SOCKS5 or direct)
         let mut target_stream = if !state.socks5_proxy.is_empty() {
