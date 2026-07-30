@@ -36,16 +36,14 @@ struct AppState {
 }
 
 #[derive(Parser, Debug)]
-#[command(name = "forward", about = "H3/H2 → TCP forward server for OpenWrt")]
+#[command(name = "forward", about = "H2 TLS forward server for OpenWrt")]
 struct Args {
-    #[arg(long, default_value = "0.0.0.0:2087")]
+    #[arg(long, default_value = "0.0.0.0:2086")]
     listen: String,
     #[arg(long)]
     password: Option<String>,
     #[arg(long, default_value = "10")]
     connect_timeout: u64,
-    #[arg(long, default_value = "0.0.0.0:2086")]
-    tcp_listen: String,
     /// Path to TLS certificate file (PEM). If omitted, generates self-signed.
     #[arg(long)]
     cert: Option<String>,
@@ -66,37 +64,6 @@ async fn main() {
     let args = Args::parse();
     let password = resolve_password(args.password.as_deref());
 
-    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
-
-    // ===== H3/QUIC server on :2087 =====
-    let cert = rcgen::generate_simple_self_signed(vec!["forward.local".into()]).unwrap();
-    let cert_der = rustls::pki_types::CertificateDer::from(cert.cert.der().to_vec());
-    let key_der = rustls::pki_types::PrivateKeyDer::try_from(
-        cert.signing_key.serialize_der(),
-    ).unwrap();
-
-    let mut tls_config = rustls::ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der], key_der)
-        .unwrap();
-    tls_config.max_early_data_size = u32::MAX;
-    tls_config.alpn_protocols = vec![ALPN.to_vec()];
-
-    let addr: SocketAddr = args.listen.parse().expect("invalid listen address");
-    assert!(addr.is_ipv4(), "only IPv4 supported");
-    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
-        quinn::crypto::rustls::QuicServerConfig::try_from(tls_config).unwrap(),
-    ));
-    let mut transport = quinn::TransportConfig::default();
-    transport.max_idle_timeout(Some(
-        quinn::IdleTimeout::try_from(Duration::from_secs(60)).unwrap(),
-    ));
-    transport.keep_alive_interval(Some(Duration::from_secs(10)));
-    server_config.transport_config(Arc::new(transport));
-    let endpoint = quinn::Endpoint::server(server_config, addr).unwrap();
-    info!("H3 forward listening on {} (QUIC)", addr);
-
-    // ===== H2 TLS server on :2086 =====
     let state = Arc::new(AppState {
         password: password.clone(),
         connect_timeout: args.connect_timeout,
@@ -106,10 +73,7 @@ async fn main() {
         next_conn_id: AtomicU64::new(1),
     });
 
-    let tcp_addr: SocketAddr = args.tcp_listen.parse().expect("invalid tcp listen address");
-    assert!(tcp_addr.is_ipv4(), "only IPv4 supported");
-
-    // Load TLS for H2
+    // Load TLS cert
     let (h2_cert_der, h2_key_der) = if let (Some(cert_path), Some(key_path)) = (&args.cert, &args.key) {
         info!("Loading TLS cert from {} and key from {}", cert_path, key_path);
         let certs = rustls_pemfile::certs(&mut std::io::BufReader::new(
@@ -139,7 +103,7 @@ async fn main() {
         (der, key)
     };
 
-    let mut h2_server_cfg = rustls::ServerConfig::builder_with_provider(
+    let mut server_cfg = rustls::ServerConfig::builder_with_provider(
         rustls::crypto::ring::default_provider().into()
     )
     .with_safe_default_protocol_versions()
@@ -147,80 +111,35 @@ async fn main() {
         .with_no_client_auth()
         .with_single_cert(vec![h2_cert_der], h2_key_der)
         .expect("h2 cert");
-    h2_server_cfg.alpn_protocols = vec![b"h2".to_vec()];
-    let tls_acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(h2_server_cfg));
+    server_cfg.alpn_protocols = vec![b"h2".to_vec()];
+    let tls_acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_cfg));
 
-    {
-        let state = state.clone();
-        let la = tcp_addr;
-        tokio::spawn(async move {
-            let listener = tokio::net::TcpListener::bind(la).await.unwrap();
-            info!("H2 TLS server listening on {} (ALPN=h2)", la);
-            loop {
-                match listener.accept().await {
-                    Ok((tcp, peer)) => {
-                        let tls = tls_acceptor.clone();
-                        let st = state.clone();
-                        tokio::spawn(async move {
-                            let tls_stream = match tls.accept(tcp).await {
-                                Ok(s) => s,
-                                Err(e) => { warn!("[{}] TLS reject: {}", peer, e); return; }
-                            };
-                            let alpn = tls_stream.get_ref().1.alpn_protocol()
-                                .map(|v| String::from_utf8_lossy(v).to_string());
-                            info!("[{}] TLS, ALPN: {:?}", peer, alpn);
-                            if let Err(e) = serve_h2(tokio_rustls::TlsStream::Server(tls_stream), &st).await {
-                                warn!("[{}] H2: {}", peer, e);
-                            }
-                        });
+    let addr: SocketAddr = args.listen.parse().expect("invalid listen address");
+    assert!(addr.is_ipv4(), "only IPv4 supported");
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    info!("H2 TLS server listening on {} (ALPN=h2)", addr);
+
+    loop {
+        match listener.accept().await {
+            Ok((tcp, peer)) => {
+                let tls = tls_acceptor.clone();
+                let st = state.clone();
+                tokio::spawn(async move {
+                    let tls_stream = match tls.accept(tcp).await {
+                        Ok(s) => s,
+                        Err(e) => { warn!("[{}] TLS reject: {}", peer, e); return; }
+                    };
+                    let alpn = tls_stream.get_ref().1.alpn_protocol()
+                        .map(|v| String::from_utf8_lossy(v).to_string());
+                    info!("[{}] TLS, ALPN: {:?}", peer, alpn);
+                    if let Err(e) = serve_h2(tokio_rustls::TlsStream::Server(tls_stream), &st).await {
+                        warn!("[{}] H2: {}", peer, e);
                     }
-                    Err(e) => error!("H2 accept: {}", e),
-                }
+                });
             }
-        });
+            Err(e) => error!("accept: {}", e),
+        }
     }
-
-    // ===== H3 handler loop =====
-    while let Some(new_conn) = endpoint.accept().await {
-        let pwd = password.clone();
-        let timeout = args.connect_timeout;
-        let st = state.clone();
-        tokio::spawn(async move {
-            match new_conn.await {
-                Ok(conn) => {
-                    info!("new QUIC connection from {}", conn.remote_address());
-                    let mut h3_conn = h3::server::Connection::new(
-                        h3_quinn::Connection::new(conn),
-                    )
-                    .await
-                    .unwrap();
-                    loop {
-                        match h3_conn.accept().await {
-                            Ok(Some(resolver)) => {
-                                let pwd = pwd.clone();
-                                let s = st.clone();
-                                tokio::spawn(async move {
-                                    if let Err(e) = handle_h3_stream(resolver, &pwd, timeout, &s).await {
-                                        error!("handle h3 stream: {}", e);
-                                    }
-                                });
-                            }
-                            Ok(None) => break,
-                            Err(err) => {
-                                error!("accept h3 error: {}", err);
-                                break;
-                            }
-                        }
-                    }
-                }
-                Err(err) => {
-                    error!("accept quic connection: {}", err);
-                }
-            }
-        });
-    }
-
-    endpoint.wait_idle().await;
 }
 
 // ──────────────────────────────────────────────
@@ -491,132 +410,3 @@ async fn send_h2_err(
 }
 
 // ──────────────────────────────────────────────
-// H3 handler (unchanged, adapted for shared state)
-// ──────────────────────────────────────────────
-
-async fn handle_h3_stream<C>(
-    resolver: h3::server::RequestResolver<C, bytes::Bytes>,
-    password: &str,
-    connect_timeout: u64,
-    state: &AppState,
-) -> anyhow::Result<()>
-where
-    C: h3::quic::Connection<bytes::Bytes>,
-{
-    use bytes::Bytes;
-
-    let (req, mut stream) = resolver.resolve_request().await?;
-
-    let target = req
-        .headers()
-        .get("x-target")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("")
-        .to_string();
-    let auth = req
-        .headers()
-        .get("x-auth")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("");
-
-    if target.is_empty() {
-        let resp = http::Response::builder()
-            .status(http::StatusCode::BAD_REQUEST)
-            .body(())
-            .unwrap();
-        stream.send_response(resp).await?;
-        stream.finish().await?;
-        return Ok(());
-    }
-
-    if !password.is_empty() && auth != password {
-        let resp = http::Response::builder()
-            .status(http::StatusCode::BAD_GATEWAY)
-            .body(())
-            .unwrap();
-        stream.send_response(resp).await?;
-        stream.finish().await?;
-        return Ok(());
-    }
-
-    info!("H3 CONNECT target={}", target);
-
-    let target_stream = if !state.socks5_proxy.is_empty() {
-        match connect_via_socks5(&state.socks5_proxy, &target, connect_timeout).await {
-            Ok(s) => s,
-            Err(_) => {
-                let resp = http::Response::builder()
-                    .status(http::StatusCode::BAD_GATEWAY)
-                    .body(())
-                    .unwrap();
-                stream.send_response(resp).await?;
-                stream.finish().await?;
-                return Ok(());
-            }
-        }
-    } else {
-        match tokio::time::timeout(
-            Duration::from_secs(connect_timeout),
-            connect_tcp_v4(&target, connect_timeout),
-        ).await {
-            Ok(Ok(s)) => s,
-            Ok(Err(_e)) => {
-                let resp = http::Response::builder()
-                    .status(http::StatusCode::BAD_GATEWAY)
-                    .body(())
-                    .unwrap();
-                stream.send_response(resp).await?;
-                stream.finish().await?;
-                return Ok(());
-            }
-            Err(_) => {
-                let resp = http::Response::builder()
-                    .status(http::StatusCode::GATEWAY_TIMEOUT)
-                    .body(())
-                    .unwrap();
-                stream.send_response(resp).await?;
-                stream.finish().await?;
-                return Ok(());
-            }
-        }
-    };
-
-    let resp = http::Response::builder()
-        .status(http::StatusCode::OK)
-        .body(())
-        .unwrap();
-    stream.send_response(resp).await?;
-
-    let (mut target_r, mut target_w) = tokio::io::split(target_stream);
-    let mut buf = vec![0u8; 65536];
-    loop {
-        tokio::select! {
-            r = target_r.read(&mut buf) => {
-                match r {
-                    Ok(0) => break,
-                    Ok(n) => {
-                        if stream.send_data(Bytes::copy_from_slice(&buf[..n])).await.is_err() {
-                            break;
-                        }
-                    }
-                    Err(_) => break,
-                }
-            }
-            d = stream.recv_data() => {
-                match d {
-                    Ok(Some(mut chunk)) => {
-                        if target_w.write_all_buf(&mut chunk).await.is_err() {
-                            break;
-                        }
-                    }
-                    Ok(None) => break,
-                    Err(_) => break,
-                }
-            }
-        }
-    }
-
-    let _ = stream.finish().await;
-    Ok(())
-}
-
