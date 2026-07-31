@@ -1,8 +1,12 @@
 use bytes::Bytes;
 use clap::Parser;
+use hickory_resolver::lookup::Lookup;
 use log::{error, info, warn};
+use rustls::client::{EchConfig, EchGreaseConfig, EchMode};
+use rustls::crypto::aws_lc_rs::hpke;
+use rustls::crypto::hpke::Hpke;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tokio::sync::RwLock;
@@ -22,16 +26,263 @@ struct Args {
     server_name: String,
     #[arg(long)]
     password: Option<String>,
-    #[arg(long, default_value_t = false)]
-    insecure: bool,
     #[arg(long, default_value = "1048576")]
     buf_size: usize,
+    /// Enable Encrypted Client Hello (ECH). Automatically fetches the ECH
+    /// config from the target domain via DNS-over-HTTPS (DoH). Falls back to
+    /// GREASE if the DoH query fails. Use --ech-config for a manual file.
+    #[arg(long, default_value_t = false)]
+    ech: bool,
+    /// Path to ECH config list file (binary). Overrides DoH auto-fetch.
+    #[arg(long)]
+    ech_config: Option<String>,
+    /// DoH endpoints (https URL) used to fetch ECH config. Defaults to
+    /// small/neutral international resolvers reachable from CN networks
+    /// (Cloudflare/Google/Quad9 DoH are SNI-blocked). Comma-separated;
+    /// the first reachable one wins. Customize via --doh url1,url2.
+    #[arg(long, value_delimiter = ',')]
+    doh: Option<Vec<String>>,
+    /// Per-query timeout for each DoH endpoint (seconds).
+    #[arg(long, default_value_t = 4)]
+    doh_timeout: u64,
 }
 
 fn resolve_connect(cli: Option<&str>) -> String {
     cli.map(|s| s.to_string())
         .or_else(|| std::env::var("RUST_FORWARD_CONNECT").ok())
         .unwrap_or_default()
+}
+
+/// Parse a DoH endpoint URL into (host, port, path).
+fn parse_doh_endpoint(url: &str) -> Option<(String, u16, String)> {
+    let rest = url.strip_prefix("https://")?;
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], rest[i..].to_string()),
+        None => (rest, "/dns-query".to_string()),
+    };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h.to_string(), p.parse().ok()?),
+        None => (authority.to_string(), 443),
+    };
+    Some((host, port, path))
+}
+
+/// Global DoH priority queue; head = current fastest endpoint.
+/// Race winner is promoted to head; queries only hit the head,
+/// avoiding conflicting responses across DoH upstreams.
+static DOH_PRIORITY: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+
+fn doh_priority(defaults: &[String]) -> MutexGuard<'static, Vec<String>> {
+    DOH_PRIORITY
+        .get_or_init(|| Mutex::new(defaults.to_vec()))
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// Result of a single DoH endpoint query.
+enum DoHAnswer {
+    /// Endpoint responded with a valid ECH config.
+    Ech(EchMode),
+    /// Authoritative negative response (NXDOMAIN / NOERROR empty / no ech=).
+    /// A definitive answer, not an endpoint failure.
+    NoEch,
+    /// Endpoint failed (connect/timeout/TLS); triggers a race.
+    Failed,
+}
+
+/// Extract ECH config from an HTTPS lookup.
+fn extract_ech_from_lookup(lookup: &Lookup) -> DoHAnswer {
+    use hickory_resolver::proto::rr::rdata::svcb::{SvcParamKey, SvcParamValue};
+    use hickory_resolver::proto::rr::RData;
+    use rustls::pki_types::EchConfigListBytes;
+
+    for record in lookup.answers() {
+        let rdata = &record.data;
+        if let RData::HTTPS(svcb) = rdata {
+            for (key, value) in &svcb.svc_params {
+                if let SvcParamKey::EchConfigList = key {
+                    if let SvcParamValue::EchConfigList(ref ech_inner) = value {
+                        let raw = EchConfigListBytes::from(ech_inner.0.clone());
+                        if let Ok(config) = EchConfig::new(raw, hpke::ALL_SUPPORTED_SUITES) {
+                            info!("DoH: ECH config found and accepted");
+                            return DoHAnswer::Ech(EchMode::from(config));
+                        } else {
+                            warn!("DoH: ECH config rejected by rustls");
+                        }
+                    }
+                }
+            }
+        }
+    }
+    warn!("DoH: no valid ECH config found in HTTPS records");
+    DoHAnswer::NoEch
+}
+
+/// Query a single DoH endpoint for ECH config.
+/// Returns Ech (with config) / NoEch (definitive negative) / Failed.
+async fn query_one_endpoint(url: &str, qname: &str, timeout: Duration) -> DoHAnswer {
+    use hickory_resolver::config::{NameServerConfig, ResolverConfig, ResolverOpts};
+    use hickory_resolver::net::runtime::TokioRuntimeProvider;
+    use hickory_resolver::proto::rr::RecordType;
+    use hickory_resolver::Resolver;
+
+    let Some((host, ep_port, path)) = parse_doh_endpoint(url) else {
+        warn!("DoH: skipping invalid endpoint {}", url);
+        return DoHAnswer::Failed;
+    };
+    let ips = match tokio::net::lookup_host((host.as_str(), ep_port)).await {
+        Ok(ips) => ips,
+        Err(e) => {
+            warn!("DoH: failed to resolve endpoint {}: {}", host, e);
+            return DoHAnswer::Failed;
+        }
+    };
+    let mut name_servers: Vec<NameServerConfig> = Vec::new();
+    for ip in ips.filter(|a| a.is_ipv4()).map(|a| a.ip()) {
+        name_servers.push(NameServerConfig::https(
+            ip,
+            Arc::from(host.as_str()),
+            Some(Arc::from(path.as_str())),
+        ));
+    }
+    if name_servers.is_empty() {
+        warn!("DoH: endpoint {} has no IPv4", host);
+        return DoHAnswer::Failed;
+    }
+
+    let config = ResolverConfig::from_parts(None, vec![], name_servers);
+    let mut opts = ResolverOpts::default();
+    opts.timeout = timeout;
+    opts.attempts = 1; // fail fast, race covers retries across endpoints
+    let resolver = match Resolver::builder_with_config(config, TokioRuntimeProvider::default())
+        .with_options(opts)
+        .build()
+    {
+        Ok(r) => r,
+        Err(e) => {
+            warn!("DoH: failed to build resolver for {}: {}", host, e);
+            return DoHAnswer::Failed;
+        }
+    };
+
+    match resolver.lookup(qname.to_string(), RecordType::HTTPS).await {
+        Ok(lookup) => extract_ech_from_lookup(&lookup),
+        Err(e) => {
+            if e.is_no_records_found() {
+                // Authoritative negative: no HTTPS record, not a failure.
+                warn!("DoH: {} authoritative negative response", host);
+                DoHAnswer::NoEch
+            } else {
+                warn!("DoH: {} lookup failed: {}", host, e);
+                DoHAnswer::Failed
+            }
+        }
+    }
+}
+
+/// Fetch ECH config for the target domain via DNS-over-HTTPS.
+///
+/// Priority-queue strategy (race, promote winner to head):
+/// 1. Fast path: query only the head endpoint (single upstream, no
+///    conflicting responses across DoH servers).
+/// 2. On head failure: race all endpoints (Happy Eyeballs); first success
+///    becomes the new head.
+async fn fetch_ech_config_doh(
+    hostname: &str,
+    port: u16,
+    defaults: &[String],
+    timeout: Duration,
+) -> Option<EchMode> {
+    // RFC 9460 §9.1: non-standard port uses _port._https.hostname
+    let qname = if port == 443 {
+        hostname.to_string()
+    } else {
+        format!("_{}._https.{}", port, hostname)
+    };
+
+    // Snapshot the queue (head = fastest). Block scope releases the
+    // MutexGuard before any await, avoiding holding the lock across awaits.
+    let endpoints: Vec<String> = {
+        let queue = doh_priority(defaults);
+        queue.clone()
+    };
+    if endpoints.is_empty() {
+        warn!("DoH: no endpoints configured");
+        return None;
+    }
+
+    info!(
+        "Fetching ECH config via DoH for {}:{} | priority: {}",
+        hostname,
+        port,
+        endpoints.join(" > ")
+    );
+    info!("DoH query: {} HTTPS", qname);
+
+    // Fast path: query only the head (single upstream).
+    match query_one_endpoint(&endpoints[0], &qname, timeout).await {
+        DoHAnswer::Ech(m) => {
+            info!("DoH: served by priority head {}", endpoints[0]);
+            return Some(m);
+        }
+        DoHAnswer::NoEch => {
+            // Authoritative negative: definitive, no endpoint switch.
+            warn!(
+                "DoH: priority head {} authoritative negative response",
+                endpoints[0]
+            );
+            return None;
+        }
+        DoHAnswer::Failed => {
+            warn!(
+                "DoH: priority head {} failed, racing all endpoints",
+                endpoints[0]
+            );
+        }
+    }
+
+    // Slow path: race all endpoints; first success (Ech/NoEch) promoted.
+    // Only head failure reaches here; negatives never race.
+    use tokio::task::JoinSet;
+    let mut set = JoinSet::new();
+    for url in &endpoints {
+        let url = url.clone();
+        let qname = qname.clone();
+        set.spawn(async move {
+            let answer = query_one_endpoint(&url, &qname, timeout).await;
+            (url, answer)
+        });
+    }
+    let mut reachable_noech: Option<String> = None;
+    while let Some(res) = set.join_next().await {
+        let Ok((url, answer)) = res else { continue };
+        match answer {
+            DoHAnswer::Ech(m) => {
+                info!("DoH: race winner {} promoted to priority head", url);
+                let mut q = doh_priority(defaults);
+                q.retain(|u| *u != url);
+                q.insert(0, url);
+                return Some(m);
+            }
+            DoHAnswer::NoEch => {
+                // Reachable but no ECH; remember first, keep racing for Ech.
+                info!("DoH: race endpoint {} reachable, no ECH config", url);
+                if reachable_noech.is_none() {
+                    reachable_noech = Some(url);
+                }
+            }
+            DoHAnswer::Failed => {}
+        }
+    }
+    // No ECH anywhere; promote a reachable endpoint so the next fast path confirms.
+    if let Some(url) = reachable_noech {
+        info!("DoH: no ECH anywhere; promoting reachable {} to priority head", url);
+        let mut q = doh_priority(defaults);
+        q.retain(|u| *u != url);
+        q.insert(0, url);
+    }
+    warn!("DoH: all endpoints failed or no ECH config");
+    None
 }
 
 #[tokio::main]
@@ -62,6 +313,52 @@ async fn main() {
         .next()
         .unwrap_or_else(|| panic!("no IPv4 address found for {}", connect_str));
 
+    // Compute ECH mode (after address parsing so connect_host/connect_port are available)
+    let ech_mode: Option<EchMode> = if let Some(ref cfg_path) = args.ech_config {
+        // Manual file override
+        info!("Loading ECH config from {}", cfg_path);
+        let bytes = std::fs::read(cfg_path)
+            .expect("failed to read ECH config file");
+        let config_list = rustls::pki_types::EchConfigListBytes::from(bytes);
+        let config = EchConfig::new(config_list, hpke::ALL_SUPPORTED_SUITES)
+            .expect("invalid ECH config");
+        info!("ECH enabled (config file)");
+        Some(EchMode::from(config))
+    } else if args.ech {
+        // Auto-fetch via DoH: try multiple endpoints, first reachable wins.
+        let endpoints: Vec<String> = match args.doh {
+            Some(ref e) => e.clone(),
+            None => vec![
+                // DoH multiple endpoint（Happy Eyeballs）
+                // self define endpoint --doh https://host:port/path(comma-separated)
+                "https://odvr.nic.cz/dns-query".to_string(),
+                "https://dns.hetzner.com/dns-query".to_string(),
+                "https://dns.digitale-gesellschaft.ch/dns-query".to_string(),
+                "https://dns.aa.net.uk/dns-query".to_string(),
+            ],
+        };
+        let timeout = Duration::from_secs(args.doh_timeout);
+        match fetch_ech_config_doh(connect_host, connect_port, &endpoints, timeout).await {
+            Some(mode) => {
+                info!("ECH enabled (DoH auto-fetch)");
+                Some(mode)
+            }
+            None => {
+                warn!("ECH DoH fetch failed, falling back to GREASE");
+                let (pub_key, _) = hpke::DH_KEM_X25519_HKDF_SHA256_AES_128
+                    .generate_key_pair()
+                    .expect("HPKE key generation for GREASE");
+                let grease = EchGreaseConfig::new(
+                    hpke::DH_KEM_X25519_HKDF_SHA256_AES_128,
+                    pub_key,
+                );
+                Some(EchMode::from(grease))
+            }
+        }
+    } else {
+        None
+    };
+
     // Create QUIC client endpoint (IPv4 only)
     let mut endpoint = quinn::Endpoint::client("0.0.0.0:0".parse::<SocketAddr>().unwrap())
         .expect("failed to create QUIC endpoint");
@@ -72,14 +369,24 @@ async fn main() {
     {
         let shared = shared.clone();
         let server_name = args.server_name.clone();
-        let insecure = args.insecure;
+        let ech_mode = ech_mode.clone();
         tokio::spawn(async move {
             loop {
-                let tls_config = if insecure {
-                    let mut cfg = rustls::ClientConfig::builder()
-                        .dangerous()
-                        .with_custom_certificate_verifier(Arc::new(NoopVerifier))
-                        .with_no_client_auth();
+                let tls_config = if let Some(ref mode) = ech_mode {
+                    let provider = Arc::new(
+                        rustls::crypto::aws_lc_rs::default_provider(),
+                    );
+                    let mut roots = rustls::RootCertStore::empty();
+                    roots.extend(
+                        webpki_roots::TLS_SERVER_ROOTS.iter().cloned(),
+                    );
+                    let mut cfg = rustls::ClientConfig::builder_with_provider(
+                        provider,
+                    )
+                    .with_ech(mode.clone())
+                    .expect("ECH not supported by provider")
+                    .with_root_certificates(roots)
+                    .with_no_client_auth();
                     cfg.alpn_protocols = vec![ALPN.to_vec()];
                     cfg
                 } else {
@@ -271,7 +578,7 @@ async fn handle_socks5(
         return Ok(());
     }
 
-    // 从响应头取 session ID
+    // Read session ID from response headers
     let session_id = resp
         .headers()
         .get("x-session-id")
@@ -280,11 +587,11 @@ async fn handle_socks5(
         .to_string();
     log::info!("[{}] session {} established", addr, session_id);
 
-    // 拆 SOCKS5 TCP
+    // Split SOCKS5 TCP
     let (mut tcp_r, tcp_w) = tcp.into_split();
     let tcp_w = Arc::new(tokio::sync::Mutex::new(tcp_w));
 
-    // 后台任务: stream1.recv_data() → tcp_w (target→client)
+    // Background: stream1.recv_data() -> tcp_w (target->client)
     let bg_w = tcp_w.clone();
     tokio::spawn(async move {
         while let Ok(Some(mut chunk)) = stream1.recv_data().await {
@@ -295,7 +602,7 @@ async fn handle_socks5(
         let _ = stream1.finish().await;
     });
 
-    // 主循环: 读客户端数据 → 并发 POST /tunnel/data (seq)
+    // Main loop: read client data, concurrent POST /tunnel/data (seq)
     let err_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut seq = 0u64;
     let sem = Arc::new(tokio::sync::Semaphore::new(16));
