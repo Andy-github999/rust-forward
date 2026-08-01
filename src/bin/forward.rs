@@ -123,6 +123,25 @@ async fn main() {
     loop {
         match listener.accept().await {
             Ok((tcp, peer)) => {
+                // Set TCP_NODELAY on the accepted socket before TLS handshake.
+                // Proxy traffic is latency-sensitive; disable Nagle.
+                // Use raw fd to avoid into_std/from_std round-trip.
+                #[cfg(target_os = "linux")]
+                {
+                    use std::os::fd::AsRawFd;
+                    let fd = tcp.as_raw_fd();
+                    let on: libc::c_int = 1;
+                    unsafe {
+                        libc::setsockopt(fd, libc::IPPROTO_TCP, libc::TCP_NODELAY,
+                            &on as *const _ as *const libc::c_void,
+                            std::mem::size_of::<libc::c_int>() as libc::socklen_t);
+                    }
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    // On Windows: TcpStream::set_nodelay requires mutable access,
+                    // but configure happens inside forward (always Linux).
+                }
                 let tls = tls_acceptor.clone();
                 let st = state.clone();
                 tokio::spawn(async move {
