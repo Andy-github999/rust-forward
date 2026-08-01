@@ -298,15 +298,67 @@ async fn handle_h2_stream(
         info!("[/connect] [{}] session {}, piping target→client", target, sid);
         // Clone Arc so we avoid RwLock lookups on every iteration
         let session_arc = state.sessions.read().await.get(&sid).cloned();
-        let mut buf = vec![0u8; 65536];
+        // Reusable buffer: read_buf appends into BytesMut (zero-copy), then
+        // split_to().freeze() yields the chunk without an extra copy.
+        // BytesMut::remaining_mut() is effectively unbounded: chunk_mut grows
+        // the buffer by 64 bytes when capacity == len, so read_buf never
+        // returns Ok(0) because the buffer is full. Top up with a full-size
+        // reserve instead so reads stay large after split_to exhausts it.
+        let mut buf = bytes::BytesMut::with_capacity(65536);
         loop {
+            // split_to() advances the buffer start and consumes that much
+            // capacity; restore the full 64KiB window once it is exhausted.
+            if buf.capacity() == buf.len() {
+                buf.reserve(65536);
+            }
             match tokio::time::timeout(
                 Duration::from_secs(30),
-                target_r.read(&mut buf),
+                target_r.read_buf(&mut buf),
             ).await {
                 Ok(Ok(0)) => break,
                 Ok(Ok(n)) => {
-                    let chunk = Bytes::copy_from_slice(&buf[..n]);
+                    // H2 backpressure: reserve capacity for this chunk, then
+                    // await until the connection grants it. Without this,
+                    // send_data buffers unboundedly when the client's H2
+                    // window is full (see h2 SendStream docs).
+                    //
+                    // poll_capacity returns the TOTAL assigned capacity and
+                    // may deliver it in increments (each > 0); loop until the
+                    // reserved amount is fully granted.
+                    send_stream.reserve_capacity(n);
+                    let mut assigned = 0usize;
+                    let capacity_ok = tokio::time::timeout(
+                        Duration::from_secs(30),
+                        std::future::poll_fn(|cx| {
+                            match send_stream.poll_capacity(cx) {
+                                std::task::Poll::Ready(Some(Ok(cap))) => {
+                                    assigned = cap;
+                                    if assigned >= n {
+                                        std::task::Poll::Ready(true)
+                                    } else {
+                                        // more capacity will come; keep polling
+                                        std::task::Poll::Pending
+                                    }
+                                }
+                                _ => std::task::Poll::Ready(false),
+                            }
+                        }),
+                    ).await;
+                    let granted = match capacity_ok {
+                        Ok(true) => true,
+                        Ok(false) => {
+                            warn!("[/connect] [{}] session {} send capacity failed (assigned={} need={})", target, sid, assigned, n);
+                            false
+                        }
+                        Err(_) => {
+                            warn!("[/connect] [{}] session {} send capacity timeout (need={})", target, sid, n);
+                            false
+                        }
+                    };
+                    if !granted {
+                        break;
+                    }
+                    let chunk = buf.split_to(n).freeze();
                     if send_stream.send_data(chunk, false).is_err() {
                         break;
                     }
@@ -364,23 +416,30 @@ async fn handle_h2_stream(
             })
             .unwrap_or(0);
 
-        // Read body
-        let mut req_data = Vec::new();
+        // Read body: collect zero-copy Bytes chunks (do NOT merge into Vec).
+        // In-order path writes each chunk directly via write_all_buf (no copy);
+        // out-of-order path merges only when buffering for reordering.
+        let mut req_chunks: Vec<bytes::Bytes> = Vec::new();
+        let mut req_len = 0usize;
         while let Some(Ok(chunk)) = body.data().await {
-            req_data.extend_from_slice(&chunk);
-            let _ = body.flow_control().release_capacity(chunk.len());
+            req_len += chunk.len();
+            let released = chunk.len();
+            req_chunks.push(chunk);
+            let _ = body.flow_control().release_capacity(released);
         }
 
         let session = state.sessions.read().await.get(&sid).cloned();
         match session {
             Some(s) => {
-                if !req_data.is_empty() {
+                if req_len > 0 {
                     let mut pend = s.pending.lock().await;
                     let expected = s.next_seq.load(Ordering::Relaxed);
                     if seq == expected {
-                        // In-order, write directly
+                        // In-order: write chunks directly, zero-copy
                         let mut t = s.target.lock().await;
-                        let _ = t.write_all(&req_data).await;
+                        for mut chunk in req_chunks {
+                            let _ = t.write_all_buf(&mut chunk).await;
+                        }
                         drop(t);
                         s.next_seq.store(expected + 1, Ordering::Relaxed);
                         let mut seq_now = expected + 1;
@@ -393,9 +452,14 @@ async fn handle_h2_stream(
                         }
                         s.next_seq.store(seq_now, Ordering::Relaxed);
                     } else if seq > expected {
-                        // Out-of-order, buffer (with cap)
+                        // Out-of-order: merge into one Vec for stable storage
+                        let mut merged = Vec::with_capacity(req_len);
+                        for c in &req_chunks {
+                            merged.extend_from_slice(c);
+                        }
+                        // Buffer (with cap)
                         if pend.len() < MAX_PENDING {
-                            pend.insert(seq, req_data);
+                            pend.insert(seq, merged);
                             info!("[/data] [sid={}] buffered seq={}, expect={}, pending={}", sid, seq, expected, pend.len());
                         } else {
                             warn!("[/data] [sid={}] pending overflow (>{}) at seq={}, dropping connection", sid, MAX_PENDING, seq);

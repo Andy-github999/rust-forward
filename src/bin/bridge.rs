@@ -606,36 +606,36 @@ async fn handle_socks5(
     let err_flag = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let mut seq = 0u64;
     let sem = Arc::new(tokio::sync::Semaphore::new(16));
+    // BytesMut + read_buf avoids per-iteration zeroing and the try_read copy.
+    // split() advances the buffer start and consumes that much capacity, so
+    // reserve() below re-arms the buffer for the next chunk (may reallocate).
+    // Keep capacity available before read_buf: len==capacity makes it return
+    // Ok(0), which the loop would otherwise treat as EOF.
+    let mut data_buf = bytes::BytesMut::with_capacity(buf_size);
     loop {
         if err_flag.load(std::sync::atomic::Ordering::Relaxed) {
             break;
         }
-        let mut data = Vec::with_capacity(buf_size);
-        data.resize(buf_size, 0);
-        let n = match tcp_r.read(&mut data).await {
+        // Clear consumed region but keep capacity (no realloc)
+        data_buf.clear();
+        if data_buf.capacity() < buf_size {
+            data_buf.reserve(buf_size - data_buf.capacity());
+        }
+        match tcp_r.read_buf(&mut data_buf).await {
             Ok(0) => break,
-            Ok(n) => n,
+            Ok(_) => {}
             Err(_) => break,
         };
-        // try_read more data
-        let mut total = n;
-        let mut more = [0u8; 65536];
+        // try_read more data (incremental, no manual copy)
         loop {
-            match tcp_r.try_read(&mut more) {
+            match tcp_r.try_read_buf(&mut data_buf) {
                 Ok(0) | Err(_) => break,
-                Ok(n) => {
-                    if total + n <= buf_size {
-                        data[total..total+n].copy_from_slice(&more[..n]);
-                        total += n;
-                    } else { break; }
-                }
+                Ok(_) => {}
             }
         }
-        data.truncate(total);
-
+        let data_bytes = data_buf.split().freeze();
         let seq_no = seq;
         seq += 1;
-        let data_bytes = Bytes::from(data);
         let sid = session_id.clone();
         let sn = server_name.to_string();
         let mut h3c = send_request.clone();
