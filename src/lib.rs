@@ -1,4 +1,5 @@
 use anyhow::Result;
+use bytes::BytesMut;
 use std::net::SocketAddr;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
@@ -124,24 +125,21 @@ pub async fn read_until_idle(
     stream: &mut TcpStream,
     first_timeout: Duration,
     idle_timeout: Duration,
-) -> Vec<u8> {
-    let mut buf = vec![0u8; 65536];
-    let mut total = 0usize;
+) -> BytesMut {
+    let mut buf = BytesMut::with_capacity(65536);
     let mut timeout = first_timeout;
     loop {
-        if total >= buf.len() {
-            buf.resize(buf.len() + 32768, 0);
+        if buf.len() == buf.capacity() {
+            buf.reserve(32768);
         }
-        match tokio::time::timeout(timeout, stream.read(&mut buf[total..])).await {
+        match tokio::time::timeout(timeout, stream.read_buf(&mut buf)).await {
             Ok(Ok(0)) | Ok(Err(_)) => break,
-            Ok(Ok(n)) => {
-                total += n;
+            Ok(Ok(_)) => {
                 timeout = idle_timeout;
             }
             _ => break,
         }
     }
-    buf.truncate(total);
     buf
 }
 

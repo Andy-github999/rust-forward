@@ -24,7 +24,7 @@ struct Session {
     target: tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>,
     last_active: AtomicU64,
     next_seq: AtomicU64,
-    pending: tokio::sync::Mutex<BTreeMap<u64, Vec<u8>>>,
+    pending: tokio::sync::Mutex<BTreeMap<u64, Bytes>>,
 }
 
 struct AppState {
@@ -290,7 +290,7 @@ async fn handle_h2_stream(
         // Send ServerHello (not end of stream)
         // If we closed here, forward could no longer push target→Chrome data
         if !resp_data.is_empty() {
-            send_stream.send_data(Bytes::from(resp_data), false)?;
+            send_stream.send_data(resp_data.freeze(), false)?;
         }
 
         // Pipe target→Chrome data through the open response body
@@ -444,19 +444,25 @@ async fn handle_h2_stream(
                         s.next_seq.store(expected + 1, Ordering::Relaxed);
                         let mut seq_now = expected + 1;
                         // Flush pending
-                        while let Some(data) = pend.remove(&seq_now) {
+                        while let Some(mut data) = pend.remove(&seq_now) {
                             let mut t = s.target.lock().await;
-                            let _ = t.write_all(&data).await;
+                            let _ = t.write_all_buf(&mut data).await;
                             drop(t);
                             seq_now += 1;
                         }
                         s.next_seq.store(seq_now, Ordering::Relaxed);
                     } else if seq > expected {
-                        // Out-of-order: merge into one Vec for stable storage
-                        let mut merged = Vec::with_capacity(req_len);
-                        for c in &req_chunks {
-                            merged.extend_from_slice(c);
-                        }
+                        // Out-of-order: keep Bytes ownership; only merge if H2
+                        // delivered one logical chunk as multiple frames.
+                        let merged = if req_chunks.len() == 1 {
+                            req_chunks.pop().unwrap()
+                        } else {
+                            let mut merged = bytes::BytesMut::with_capacity(req_len);
+                            for c in &req_chunks {
+                                merged.extend_from_slice(c);
+                            }
+                            merged.freeze()
+                        };
                         // Buffer (with cap)
                         if pend.len() < MAX_PENDING {
                             pend.insert(seq, merged);

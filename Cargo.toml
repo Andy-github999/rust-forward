@@ -32,6 +32,8 @@ h2 = "0.4"
 tokio-rustls = "0.26"
 rustls-pemfile = "2"
 hickory-resolver = { version = "0.26", default-features = false, features = ["https-aws-lc-rs", "tokio", "webpki-roots"] }
+tokio-tungstenite = { version = "0.30", default-features = false, features = ["handshake", "stream"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "async-await", "sink"] }
 
 [profile.release]
 lto = "fat"
