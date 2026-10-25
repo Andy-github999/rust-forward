@@ -121,6 +121,11 @@ pub async fn connect_via_socks5(
 /// Read from a TCP stream with idle timeout batching.
 /// - Waits up to `first_timeout` for the first byte.
 /// - After receiving data, waits up to `idle_timeout` between chunks.
+///
+/// The `try_read` fast path matters: the caller uses this to grab a TLS
+/// ServerHello, which the target normally writes in one burst. Without it we
+/// pay a full `idle_timeout` sleep on the *last* chunk of every call, and that
+/// delay lands squarely on the `/connect` critical path.
 pub async fn read_until_idle(
     stream: &mut TcpStream,
     first_timeout: Duration,
@@ -132,6 +137,15 @@ pub async fn read_until_idle(
         if buf.len() == buf.capacity() {
             buf.reserve(32768);
         }
+        // Drain whatever is already queued before paying for a timer.
+        match stream.try_read_buf(&mut buf) {
+            Ok(0) => break,          // EOF
+            Ok(_) => {
+                timeout = idle_timeout;
+                continue;
+            }
+            Err(_) => {}             // WouldBlock: fall through to the timed read
+        }
         match tokio::time::timeout(timeout, stream.read_buf(&mut buf)).await {
             Ok(Ok(0)) | Ok(Err(_)) => break,
             Ok(Ok(_)) => {
@@ -142,6 +156,57 @@ pub async fn read_until_idle(
     }
     buf
 }
+
+// ── Wakeup-loss guard ────────────────────────
+
+/// Re-poll a future on a fixed cadence until it resolves.
+///
+/// Some layers in this stack drop a wakeup when data lands on a stream whose
+/// task is parked. The evidence is unambiguous: a 12-connection burst showed
+/// `udp_rx` jump by the whole 34KB of responses inside a single 2s sample,
+/// while `recv_response()` stayed `Pending` for another 20-30s and then
+/// resolved all at once. The bytes were already sitting in quinn's stream
+/// buffer; nothing had re-polled the future to notice.
+///
+/// Re-polling is safe: every `poll` re-registers the same waker, and a future
+/// that has nothing to do just returns `Pending` again. The cost is one cheap
+/// poll per `period` per waiting stream, which is nothing next to the seconds
+/// it saves.
+pub struct Kick<F> {
+    inner: std::pin::Pin<Box<F>>,
+    interval: tokio::time::Interval,
+}
+
+impl<F: std::future::Future> std::future::Future for Kick<F> {
+    type Output = F::Output;
+
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<F::Output> {
+        let this = self.get_mut();
+        loop {
+            if let std::task::Poll::Ready(v) = this.inner.as_mut().poll(cx) {
+                return std::task::Poll::Ready(v);
+            }
+            match this.interval.poll_tick(cx) {
+                std::task::Poll::Ready(_) => continue,
+                std::task::Poll::Pending => return std::task::Poll::Pending,
+            }
+        }
+    }
+}
+
+/// Wrap `fut` so a lost wakeup cannot stall it for longer than `period`.
+pub fn kick<F: std::future::Future>(fut: F, period: Duration) -> Kick<F> {
+    let mut interval = tokio::time::interval(period);
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    Kick {
+        inner: Box::pin(fut),
+        interval,
+    }
+}
+
 
 
 
