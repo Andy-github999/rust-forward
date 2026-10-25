@@ -11,6 +11,10 @@ path = "src/bin/bridge.rs"
 name = "forward"
 path = "src/bin/forward.rs"
 
+[[bin]]
+name = "quicprobe"
+path = "src/bin/quicprobe.rs"
+
 [dependencies]
 tokio = { version = "1", features = ["full"] }
 rustls = { version = "0.23", features = ["aws_lc_rs"] }
